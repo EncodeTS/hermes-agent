@@ -395,6 +395,14 @@ class MemoryManager:
     swallows per-provider exceptions.
     """
 
+    # Process-wide registry of in-flight external prefetch threads, keyed by provider
+    # name. A new MemoryManager is built per agent init, so a per-instance registry
+    # would let every fresh manager spawn one more stuck thread against the same
+    # provider (#134392); shared, a stuck call suppresses new spawns from any manager
+    # until it returns.
+    _EXTERNAL_PREFETCH_THREADS: dict[str, threading.Thread] = {}
+    _EXTERNAL_PREFETCH_LOCK = threading.Lock()
+
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
         self._providers: list[MemoryProvider] = []
         self._tool_to_provider: dict[str, MemoryProvider] = {}
@@ -405,8 +413,6 @@ class MemoryManager:
         if timeout <= 0:
             raise ValueError("external_prefetch_timeout must be positive")
         self._external_prefetch_timeout = timeout
-        self._external_prefetch_threads: dict[str, threading.Thread] = {}
-        self._external_prefetch_lock = threading.Lock()
         # Single-worker background executor for end-of-turn sync/prefetch, created lazily so
         # the builtin-only path spawns no threads; one worker serializes a provider's writes.
         self._sync_executor: Optional[ThreadPoolExecutor] = None
@@ -534,12 +540,12 @@ class MemoryManager:
                 result_box["error"] = exc
 
         thread = spawn_context_thread(_run, name=f"memory-prefetch-{provider.name}")
-        with self._external_prefetch_lock:
-            existing = self._external_prefetch_threads.get(provider.name)
+        with self._EXTERNAL_PREFETCH_LOCK:
+            existing = self._EXTERNAL_PREFETCH_THREADS.get(provider.name)
             if existing is not None and existing.is_alive():
                 logger.debug("Memory provider '%s' prefetch is still running; skipping this turn", provider.name)
                 return ""
-            self._external_prefetch_threads[provider.name] = thread
+            self._EXTERNAL_PREFETCH_THREADS[provider.name] = thread
             thread.start()
 
         thread.join(self._external_prefetch_timeout)
@@ -550,9 +556,9 @@ class MemoryManager:
             )
             return ""
 
-        with self._external_prefetch_lock:
-            if self._external_prefetch_threads.get(provider.name) is thread:
-                self._external_prefetch_threads.pop(provider.name, None)
+        with self._EXTERNAL_PREFETCH_LOCK:
+            if self._EXTERNAL_PREFETCH_THREADS.get(provider.name) is thread:
+                self._EXTERNAL_PREFETCH_THREADS.pop(provider.name, None)
         if "error" in result_box:
             raise result_box["error"]
         result = result_box.get("value", "")

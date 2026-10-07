@@ -480,8 +480,8 @@ class TestMemoryManager:
 
         deadline = time.monotonic() + 1.0
         while (
-            external.name in mgr._external_prefetch_threads
-            and mgr._external_prefetch_threads[external.name].is_alive()
+            external.name in mgr._EXTERNAL_PREFETCH_THREADS
+            and mgr._EXTERNAL_PREFETCH_THREADS[external.name].is_alive()
             and time.monotonic() < deadline
         ):
             time.sleep(0.01)
@@ -490,7 +490,28 @@ class TestMemoryManager:
 
         assert result == "builtin memory\n\nlate external memory"
         assert external.prefetch_queries == ["query", "query 3"]
-        assert external.name not in mgr._external_prefetch_threads
+        assert external.name not in mgr._EXTERNAL_PREFETCH_THREADS
+
+    def test_stuck_prefetch_thread_is_shared_across_managers(self):
+        """#134392: a new MemoryManager is built per agent init, so the in-flight
+        registry must be process-wide — N fresh managers against one stuck provider
+        keep at most one live ``memory-prefetch-*`` thread, not one per manager.
+        """
+        external = BlockingPrefetchProvider("cross-manager-stuck")
+        try:
+            for i in range(5):
+                mgr = MemoryManager(external_prefetch_timeout=0.01)
+                mgr.add_provider(external)
+                mgr._prefetch_provider(external, "query", session_id=f"s{i}")
+
+            live = [
+                t for t in threading.enumerate()
+                if t.name.startswith("memory-prefetch-cross-manager-stuck")
+            ]
+            assert len(live) == 1
+            assert external.prefetch_queries == ["query"]
+        finally:
+            external.release.set()
 
 
 class TestPluginMemoryDiscovery:
