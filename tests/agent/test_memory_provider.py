@@ -586,6 +586,32 @@ class TestMemoryManager:
             for gate in provider.gates:
                 gate.set()
 
+    def test_failed_prefetch_thread_start_leaves_no_registry_entry(self, monkeypatch):
+        """A thread that never started can't clear its own entry; it must not gate the provider."""
+        import agent.memory_manager as mm_mod
+
+        provider = FakeMemoryProvider("start-fails")
+        provider._prefetch_result = "recovered"
+        mgr = MemoryManager(external_prefetch_timeout=0.01)
+        mgr.add_provider(provider)
+        real_spawn = mm_mod.spawn_context_thread
+
+        def failing_spawn(*args, **kwargs):
+            thread = real_spawn(*args, **kwargs)
+            def boom():
+                raise RuntimeError("can't start new thread")
+            thread.start = boom
+            return thread
+
+        monkeypatch.setattr(mm_mod, "spawn_context_thread", failing_spawn)
+        with pytest.raises(RuntimeError):
+            mgr._prefetch_provider(provider, "q", session_id="s")
+        assert (mgr._home_key, provider.name) not in MemoryManager._EXTERNAL_PREFETCH_THREADS
+        monkeypatch.setattr(mm_mod, "spawn_context_thread", real_spawn)
+        mgr = MemoryManager(external_prefetch_timeout=1.0)
+        mgr.add_provider(provider)
+        assert mgr._prefetch_provider(provider, "q", session_id="s") == "recovered"
+
     def test_stuck_prefetch_registry_is_scoped_per_hermes_home(self, tmp_path):
         """Two profiles served by one process may configure a same-named provider
         against different backends; a hung call in one must not suppress the other.

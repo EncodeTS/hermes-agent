@@ -480,7 +480,15 @@ class MemoryManager:
                 logger.debug("Memory provider '%s' prefetch is still stuck; skipping this turn", provider.name)
                 return ""
             inflight[thread] = now + self._external_prefetch_timeout
-            thread.start()
+            try:
+                thread.start()
+            except RuntimeError:
+                # Never started, so its finally never runs: drop the entry or it would gate the
+                # provider forever once its deadline passes.
+                inflight.pop(thread, None)
+                if not inflight:
+                    self._EXTERNAL_PREFETCH_THREADS.pop(key, None)
+                raise
 
         thread.join(self._external_prefetch_timeout)
         if thread.is_alive():
