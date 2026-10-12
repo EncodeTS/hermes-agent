@@ -670,6 +670,16 @@ class TestAgentCacheIdleResume:
         finally:
             agent.close()
 
+    def test_close_after_release_clients_does_not_reextract_or_reshutdown(self):
+        """A soft-released agent that is later close()d (e.g. a reset racing an eviction) must not run
+        end-of-session extraction against, or shut down a second time, providers already shut down."""
+        events = []
+        agent, provider = self._agent_with_writer_provider("mem-release-then-close-test", events)
+        agent.release_clients()
+        agent.close()
+        assert events == ["shutdown"]
+        assert not provider.writer.is_alive()
+
     def test_gateway_soft_evict_commits_memory_before_provider_shutdown(self):
         """The sweep eviction path must run end-of-session extraction BEFORE release_clients()
         shuts the providers down (a shut-down provider can no longer commit)."""

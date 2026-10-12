@@ -874,7 +874,9 @@ class AIAgent(
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
-        if self._memory_manager:
+        # A soft release (release_clients) may already have shut the providers down; extracting
+        # against shut-down providers would only fail, and a second shutdown() is not guaranteed safe.
+        if self._memory_manager and not getattr(self, "_memory_providers_released", False):
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception as e:
@@ -968,6 +970,7 @@ class AIAgent(
         _mm = getattr(self, "_memory_manager", None)
         if _mm is not None and not getattr(_mm, "_shutting_down", False):
             _quietly(_mm.shutdown_all)
+            self._memory_providers_released = True
 
     def close(self) -> None:
         """Release every resource this agent holds (idempotent); each phase is guarded so one failure never
