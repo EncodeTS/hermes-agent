@@ -606,6 +606,83 @@ class TestAgentCacheIdleResume:
             "end-of-session extraction, too heavy for a soft-evicted session."
         )
 
+    @staticmethod
+    def _agent_with_writer_provider(session_id, events):
+        """Real AIAgent + real MemoryManager whose provider owns a writer thread released only by shutdown()."""
+        import queue
+        from agent.memory_manager import MemoryManager
+        from agent.memory_provider import MemoryProvider
+        from run_agent import AIAgent
+
+        class _WriterProvider(MemoryProvider):
+            def __init__(self):
+                self._q = queue.Queue()
+                self.writer = threading.Thread(target=self._run, name="test-mem-writer", daemon=True)
+                self.writer.start()
+
+            def _run(self):
+                while self._q.get() is not None:
+                    pass
+
+            @property
+            def name(self):
+                return "writerstub"
+
+            def is_available(self):
+                return True
+
+            def initialize(self, session_id, **kwargs):
+                pass
+
+            def get_tool_schemas(self):
+                return []
+
+            def on_session_end(self, messages):
+                events.append("on_session_end")
+
+            def shutdown(self):
+                events.append("shutdown")
+                self._q.put(None)
+                self.writer.join(timeout=5)
+
+        agent = AIAgent(
+            model="anthropic/claude-sonnet-4", api_key="test",
+            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            max_iterations=5, quiet_mode=True,
+            skip_context_files=True, skip_memory=True, session_id=session_id,
+        )
+        provider = _WriterProvider()
+        manager = MemoryManager()
+        manager.add_provider(provider)
+        agent._memory_manager = manager
+        return agent, provider
+
+    def test_release_clients_joins_real_provider_writer_thread(self):
+        """Soft eviction must stop a real provider's writer thread (the leak), without extraction."""
+        events = []
+        agent, provider = self._agent_with_writer_provider("mem-writer-evict-test", events)
+        assert provider.writer.is_alive()
+        try:
+            agent.release_clients()
+            agent.release_clients()  # idempotent: guarded on the manager's _shutting_down
+            assert not provider.writer.is_alive()
+            assert events == ["shutdown"]
+        finally:
+            agent.close()
+
+    def test_gateway_soft_evict_commits_memory_before_provider_shutdown(self):
+        """The sweep eviction path must run end-of-session extraction BEFORE release_clients()
+        shuts the providers down (a shut-down provider can no longer commit)."""
+        events = []
+        agent, provider = self._agent_with_writer_provider("mem-commit-order-test", events)
+        runner = _make_runner()
+        try:
+            runner._commit_then_release_soft(agent, "agent:main:telegram:dm:1")
+            assert events == ["on_session_end", "shutdown"]
+            assert not provider.writer.is_alive()
+        finally:
+            agent.close()
+
     def test_close_vs_release_full_teardown_difference(self, monkeypatch):
         """close() tears down task state; release_clients() does not.
 
