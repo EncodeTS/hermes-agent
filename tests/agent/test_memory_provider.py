@@ -8,7 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from agent.memory_provider import MemoryProvider
-from agent.memory_manager import MemoryManager, inject_memory_provider_tools
+from agent.memory_manager import MemoryManager
+from agent.memory_manager_tools import inject_memory_provider_tools
 
 # ---------------------------------------------------------------------------
 # Concrete test provider
@@ -1210,7 +1211,7 @@ class TestNormalizeToolSchema:
 
 
     def test_non_dict_rejected(self):
-        from agent.memory_manager import normalize_tool_schema
+        from agent.memory_manager_tools import normalize_tool_schema
         assert normalize_tool_schema("nope") is None
         assert normalize_tool_schema(None) is None
 
@@ -1321,24 +1322,24 @@ class TestSystemPromptGateParity:
         return agent, mgr, provider
 
     def test_tools_exposed_when_memory_in_enabled_toolsets(self):
-        from agent.memory_manager import memory_provider_tools_exposed
+        from agent.memory_manager_tools import memory_provider_tools_exposed
         agent, _mgr, _p = self._agent_with_provider(enabled_toolsets=["memory"])
         assert memory_provider_tools_exposed(agent) is True
 
     def test_tools_hidden_when_memory_in_disabled_toolsets(self):
-        from agent.memory_manager import memory_provider_tools_exposed
+        from agent.memory_manager_tools import memory_provider_tools_exposed
         agent, _mgr, _p = self._agent_with_provider(disabled_toolsets=["memory"])
         assert memory_provider_tools_exposed(agent) is False
 
     def test_tools_hidden_when_memory_not_in_enabled_toolsets(self):
-        from agent.memory_manager import memory_provider_tools_exposed
+        from agent.memory_manager_tools import memory_provider_tools_exposed
         agent, _mgr, _p = self._agent_with_provider(enabled_toolsets=["web_search"])
         assert memory_provider_tools_exposed(agent) is False
 
     def test_tools_exposed_when_memory_tool_already_present(self):
         """The built-in "memory" tool is a sufficient opt-in even when the
         toolset gate says nothing about memory."""
-        from agent.memory_manager import memory_provider_tools_exposed
+        from agent.memory_manager_tools import memory_provider_tools_exposed
         tools = [
             {"type": "function", "function": {"name": "memory", "description": "x", "parameters": {}}},
         ]
@@ -1349,7 +1350,7 @@ class TestSystemPromptGateParity:
         """``inject_memory_provider_tools`` and ``memory_provider_tools_exposed``
         must agree — both determine whether provider tools are presented to
         the model (#81014)."""
-        from agent.memory_manager import inject_memory_provider_tools, memory_provider_tools_exposed
+        from agent.memory_manager_tools import inject_memory_provider_tools, memory_provider_tools_exposed
 
         # Disabled toolsets — neither path should add or advertise provider tools.
         agent, _mgr, _p = self._agent_with_provider(disabled_toolsets=["memory"])
