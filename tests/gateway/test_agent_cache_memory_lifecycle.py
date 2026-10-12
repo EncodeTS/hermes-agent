@@ -3,6 +3,8 @@ end-of-session teardown (``shutdown_memory_provider`` / ``close``)."""
 
 import threading
 
+import pytest
+
 from tests.gateway.test_agent_cache import _make_runner
 
 
@@ -125,7 +127,7 @@ class TestAgentCacheMemoryLifecycle:
         assert provider.writer.is_alive()
         try:
             agent.release_clients()
-            agent.release_clients()  # idempotent: guarded on the manager's _shutting_down
+            agent.release_clients()  # idempotent: the teardown claim is once-only
             assert not provider.writer.is_alive()
             assert events == ["shutdown"]
         finally:
@@ -177,3 +179,42 @@ class TestAgentCacheMemoryLifecycle:
             assert not provider.writer.is_alive()
         finally:
             agent.close()
+
+    @pytest.mark.asyncio
+    async def test_eviction_after_timed_out_reset_cleanup_leaves_shutdown_to_it(self, monkeypatch):
+        """/new gives up waiting on its cleanup worker after the timeout and then evicts the same agent.
+        The worker is still inside on_session_end(), so the eviction must not shut the providers
+        down under that extraction, and the providers must be shut down exactly once, after it."""
+        import gateway.slash_commands_session as session_cmds
+        from tests.waiting import wait_until
+
+        events = []
+        agent, provider = self._agent_with_writer_provider("mem-reset-evict-race-test", events)
+        in_session_end, let_finish = threading.Event(), threading.Event()
+
+        def slow_session_end(messages):
+            events.append("on_session_end:start")
+            in_session_end.set()
+            assert let_finish.wait(10)
+            events.append("on_session_end:done")
+
+        provider.on_session_end = slow_session_end
+        agent._session_messages = [{"role": "user", "content": "remember this"}]
+        key = "agent:main:telegram:dm:1"
+        runner = _make_runner()
+        runner._agent_cache[key] = (agent, "sig")
+        # Only a deadline for giving up on the worker: on_session_end blocks until let_finish, so
+        # /new always times out, however slow the runner.
+        monkeypatch.setattr(session_cmds, "_RESET_CLEANUP_TIMEOUT_S", 0.05)
+        try:
+            await runner._cleanup_old_agent_for_reset(key)
+            assert in_session_end.wait(10)
+            runner._evict_cached_agent(key)
+            wait_until(lambda: agent._session_messages == [], what="the soft eviction to finish")
+            assert events == ["on_session_end:start"], "eviction shut providers down mid-extraction"
+            assert provider.writer.is_alive()
+        finally:
+            let_finish.set()
+            runner._housekeeping_executor.shutdown(wait=True)
+        assert events == ["on_session_end:start", "on_session_end:done", "shutdown"]
+        assert not provider.writer.is_alive()

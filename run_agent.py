@@ -154,6 +154,21 @@ def _quietly(fn: Callable, *args, **kwargs) -> None:
         pass
 
 
+_MEMORY_TEARDOWN_CLAIM_LOCK = threading.Lock()
+
+
+def _claim_memory_teardown(agent: Any) -> bool:
+    """Once-only claim on an agent's memory-provider teardown, shared by end-of-session shutdown
+    and soft release. A /new cleanup worker left running past its timeout can still be inside
+    ``on_session_end()`` when the same agent is evicted; the loser skips, so extraction and
+    ``shutdown_all()`` never run concurrently or twice."""
+    with _MEMORY_TEARDOWN_CLAIM_LOCK:
+        if getattr(agent, "_memory_teardown_claimed", False):
+            return False
+        agent._memory_teardown_claimed = True
+        return True
+
+
 def _call_engine_hook(engine: Any, hook: str, *args, **kwargs) -> None:
     """Invoke an optional context-engine lifecycle hook; failures are logged, never raised."""
     if not hasattr(engine, hook):
@@ -874,9 +889,9 @@ class AIAgent(
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
-        # A soft release (release_clients) may already have shut the providers down; extracting
-        # against shut-down providers would only fail, and a second shutdown() is not guaranteed safe.
-        if self._memory_manager and not getattr(self, "_memory_providers_released", False):
+        # One claim shared with release_clients(): whichever path claims first owns extraction and
+        # shutdown_all(); the other skips, so they never overlap or shut providers down twice.
+        if self._memory_manager and _claim_memory_teardown(self):
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception as e:
@@ -968,10 +983,11 @@ class AIAgent(
         # are checked out exclusively, so a live shared manager is never reachable
         # here; delegation/review children run skip_memory=True (manager is None).
         _mm = getattr(self, "_memory_manager", None)
-        if _mm is not None and not getattr(_mm, "_shutting_down", False):
-            # Claimed before the (bounded, seconds-long) drain so a close() racing it skips the
-            # extraction and second provider shutdown instead of running them mid-teardown.
-            self._memory_providers_released = True
+        # Claimed before the (bounded, seconds-long) drain, and shared with shutdown_memory_provider():
+        # a /new cleanup still inside on_session_end() holds the claim, so this eviction leaves the
+        # shutdown to that worker instead of tearing the providers down under its extraction. A manager
+        # already draining (shut down by another owner) is left alone too.
+        if _mm is not None and not getattr(_mm, "_shutting_down", False) and _claim_memory_teardown(self):
             _quietly(_mm.shutdown_all)
 
     def close(self) -> None:
