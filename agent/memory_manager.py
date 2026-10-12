@@ -303,15 +303,16 @@ class MemoryManager:
     swallows per-provider exceptions.
     """
 
-    # Process-wide registry of in-flight external prefetch threads, keyed by
+    # Process-wide registry of in-flight external prefetch threads and their deadlines, keyed by
     # (Hermes home, provider name). A new MemoryManager is built per agent init, so a
     # per-instance registry would let every fresh manager spawn one more stuck thread
-    # against the same provider (#134392); shared, a stuck call suppresses new spawns
-    # from any manager until it returns. The home is part of the key because one
-    # gateway process can serve several profiles, each with its own config and
-    # credentials for a same-named provider: one profile's hung backend must not
-    # silence another's recall.
-    _EXTERNAL_PREFETCH_THREADS: dict[tuple[str, str], threading.Thread] = {}
+    # against the same provider (#134392); shared, any call past its deadline suppresses new
+    # spawns from every manager until it returns. Healthy concurrent prefetches from
+    # different sessions still run side by side, and each thread removes only its own
+    # entry. The home is part of the key because one gateway process can serve several
+    # profiles, each with its own config and credentials for a same-named provider: one
+    # profile's hung backend must not silence another's recall.
+    _EXTERNAL_PREFETCH_THREADS: dict[tuple[str, str], dict[threading.Thread, float]] = {}
     _EXTERNAL_PREFETCH_LOCK = threading.Lock()
     # Same idea for background writes: start times of in-flight sync_turn / queue_prefetch calls per
     # (Hermes home, provider name). Python cannot stop a thread, so a call that never returns pins its
@@ -462,19 +463,23 @@ class MemoryManager:
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 result_box["error"] = exc
             finally:
-                # A timed-out call clears its own entry when it finally returns, so the
-                # process-wide registry never pins a finished thread.
+                # Every call removes its own entry when it returns, so the registry never pins
+                # a finished thread and one call's return never forgets another stuck one.
                 with self._EXTERNAL_PREFETCH_LOCK:
-                    if self._EXTERNAL_PREFETCH_THREADS.get(key) is thread:
-                        self._EXTERNAL_PREFETCH_THREADS.pop(key, None)
+                    inflight = self._EXTERNAL_PREFETCH_THREADS.get(key)
+                    if inflight is not None:
+                        inflight.pop(thread, None)
+                        if not inflight:
+                            self._EXTERNAL_PREFETCH_THREADS.pop(key, None)
 
         thread = spawn_context_thread(_run, name=f"memory-prefetch-{provider.name}")
         with self._EXTERNAL_PREFETCH_LOCK:
-            existing = self._EXTERNAL_PREFETCH_THREADS.get(key)
-            if existing is not None and existing.is_alive():
-                logger.debug("Memory provider '%s' prefetch is still running; skipping this turn", provider.name)
+            inflight = self._EXTERNAL_PREFETCH_THREADS.setdefault(key, {})
+            now = time.monotonic()
+            if any(now > deadline for deadline in inflight.values()):
+                logger.debug("Memory provider '%s' prefetch is still stuck; skipping this turn", provider.name)
                 return ""
-            self._EXTERNAL_PREFETCH_THREADS[key] = thread
+            inflight[thread] = now + self._external_prefetch_timeout
             thread.start()
 
         thread.join(self._external_prefetch_timeout)
@@ -485,9 +490,6 @@ class MemoryManager:
             )
             return ""
 
-        with self._EXTERNAL_PREFETCH_LOCK:
-            if self._EXTERNAL_PREFETCH_THREADS.get(key) is thread:
-                self._EXTERNAL_PREFETCH_THREADS.pop(key, None)
         if "error" in result_box:
             raise result_box["error"]
         result = result_box.get("value", "")

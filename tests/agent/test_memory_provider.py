@@ -480,11 +480,7 @@ class TestMemoryManager:
         external.release.set()
 
         deadline = time.monotonic() + 1.0
-        while (
-            (mgr._home_key, external.name) in mgr._EXTERNAL_PREFETCH_THREADS
-            and mgr._EXTERNAL_PREFETCH_THREADS[(mgr._home_key, external.name)].is_alive()
-            and time.monotonic() < deadline
-        ):
+        while (mgr._home_key, external.name) in mgr._EXTERNAL_PREFETCH_THREADS and time.monotonic() < deadline:
             time.sleep(0.01)
 
         result = mgr.prefetch_all("query 3")
@@ -524,6 +520,71 @@ class TestMemoryManager:
             assert external.prefetch_queries == ["query", "after"]
         finally:
             external.release.set()
+
+    def test_healthy_concurrent_prefetches_from_two_sessions_both_recall(self):
+        """Only a TIMED-OUT call gates other managers: a slow-but-healthy prefetch in one session
+        must not blank the recall of another session that prefetches meanwhile."""
+        first = BlockingPrefetchProvider("concurrent-healthy")
+        first._prefetch_result = "session a memory"
+        second = FakeMemoryProvider("concurrent-healthy")
+        second._prefetch_result = "session b memory"
+        mgr_a = MemoryManager(external_prefetch_timeout=5.0)
+        mgr_a.add_provider(first)
+        mgr_b = MemoryManager(external_prefetch_timeout=5.0)
+        mgr_b.add_provider(second)
+        results = {}
+        worker = threading.Thread(target=lambda: results.update(a=mgr_a.prefetch_all("q", session_id="a")))
+        worker.start()
+        try:
+            assert first.started.wait(timeout=2.0)
+            results["b"] = mgr_b.prefetch_all("q", session_id="b")
+        finally:
+            first.release.set()
+            worker.join(timeout=5.0)
+        assert results == {"a": "session a memory", "b": "session b memory"}
+
+    def test_one_stuck_call_returning_does_not_reopen_while_another_is_stuck(self):
+        """Two sessions start a prefetch before either times out and both hang. When one of them
+        finally returns, the other is still stuck, so fresh managers must keep skipping."""
+
+        class PerCallBlocking(FakeMemoryProvider):
+            def __init__(self, name):
+                super().__init__(name=name)
+                self.gates, self.lock = [], threading.Lock()
+
+            def prefetch(self, query, *, session_id=""):
+                gate = threading.Event()
+                with self.lock:
+                    self.gates.append(gate)
+                    self.prefetch_queries.append(query)
+                gate.wait(timeout=5.0)
+                return ""
+
+        provider = PerCallBlocking("two-stuck")
+        mgr_a = MemoryManager(external_prefetch_timeout=0.3)
+        mgr_a.add_provider(provider)
+        mgr_b = MemoryManager(external_prefetch_timeout=0.3)
+        mgr_b.add_provider(provider)
+        workers = [threading.Thread(target=m.prefetch_all, args=(q,)) for m, q in ((mgr_a, "a"), (mgr_b, "b"))]
+        try:
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join(timeout=5.0)
+            assert sorted(provider.prefetch_queries) == ["a", "b"]  # both started, both timed out
+
+            provider.gates[0].set()  # one stuck call returns; the other is still hung
+            deadline = time.monotonic() + 2.0
+            while len(MemoryManager._EXTERNAL_PREFETCH_THREADS.get((mgr_a._home_key, provider.name), {})) > 1:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            fresh = MemoryManager(external_prefetch_timeout=0.3)
+            fresh.add_provider(provider)
+            fresh.prefetch_all("c")
+            assert sorted(provider.prefetch_queries) == ["a", "b"]  # "c" was skipped, not spawned
+        finally:
+            for gate in provider.gates:
+                gate.set()
 
     def test_stuck_prefetch_registry_is_scoped_per_hermes_home(self, tmp_path):
         """Two profiles served by one process may configure a same-named provider
