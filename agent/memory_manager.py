@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
@@ -33,6 +34,10 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+# A background provider call (sync_turn / queue_prefetch) running longer than this is treated as
+# stuck: later calls for the same provider are skipped until it returns. Well above the shutdown
+# drain bound and the prefetch timeout so a slow-but-healthy backend is never skipped.
+_BACKGROUND_CALL_STALL_S = 30.0
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -406,6 +411,14 @@ class MemoryManager:
     # silence another's recall.
     _EXTERNAL_PREFETCH_THREADS: dict[tuple[str, str], threading.Thread] = {}
     _EXTERNAL_PREFETCH_LOCK = threading.Lock()
+    # Same idea for background writes: start times of in-flight sync_turn / queue_prefetch calls per
+    # (Hermes home, provider name). Python cannot stop a thread, so a call that never returns pins its
+    # mem-sync worker for the process lifetime; managers are rebuilt per agent, so without a shared
+    # view every fresh manager would start one more call against the hung backend and pin one more
+    # thread. Calls are skipped while any call for the key is stuck past _BACKGROUND_CALL_STALL_S.
+    _BACKGROUND_CALLS: dict[tuple[str, str], dict[object, float]] = {}
+    _BACKGROUND_SKIPS: dict[tuple[str, str], int] = {}
+    _BACKGROUND_CALLS_LOCK = threading.Lock()
 
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
         self._providers: list[MemoryProvider] = []
@@ -606,7 +619,8 @@ class MemoryManager:
             return
         clean_query = _redact_for_provider(clean_query)
         self._submit_background(lambda: self._each_provider(
-            "queue_prefetch failed (non-fatal)", lambda p: p.queue_prefetch(clean_query, session_id=session_id),
+            "queue_prefetch failed (non-fatal)",
+            lambda p: self._call_unless_stalled(p, lambda: p.queue_prefetch(clean_query, session_id=session_id)),
             providers=providers,
         ), kind="prefetch")
 
@@ -642,7 +656,8 @@ class MemoryManager:
             for keyword, value in optional_kwargs.items():
                 if value is not None and self._provider_sync_accepts(provider, keyword):
                     kwargs[keyword] = value
-            provider.sync_turn(clean_user_content, assistant_content, **kwargs)
+            self._call_unless_stalled(
+                provider, lambda: provider.sync_turn(clean_user_content, assistant_content, **kwargs))
 
         self._submit_background(
             lambda: self._each_provider("sync_turn failed", _sync, level=logging.WARNING, providers=providers)
@@ -686,6 +701,36 @@ class MemoryManager:
             fn()
         except Exception as e:  # pragma: no cover - fn guards internally
             logger.debug("Inline memory background task failed: %s", e)
+
+    def _call_unless_stalled(self, provider: MemoryProvider, call: Callable[[], Any]) -> None:
+        """Run a background provider call unless an earlier one for the same provider (any manager in
+        this process) is stuck; skipping costs that turn's write/prefetch but keeps the thread count
+        bounded. The builtin provider is local and never gated."""
+        if provider.name == "builtin":
+            call()
+            return
+        key = (self._home_key, provider.name)
+        token = object()
+        now = time.monotonic()
+        with self._BACKGROUND_CALLS_LOCK:
+            calls = self._BACKGROUND_CALLS.setdefault(key, {})
+            if any(now - started > _BACKGROUND_CALL_STALL_S for started in calls.values()):
+                skips = self._BACKGROUND_SKIPS[key] = self._BACKGROUND_SKIPS.get(key, 0) + 1
+                if skips == 1 or skips % 100 == 0:
+                    logger.warning(
+                        "Memory provider '%s' has a background call stuck for over %.0fs; skipping its "
+                        "sync/prefetch until it returns (%d skipped)", provider.name, _BACKGROUND_CALL_STALL_S, skips,
+                    )
+                return
+            calls[token] = now
+        try:
+            call()
+        finally:
+            with self._BACKGROUND_CALLS_LOCK:
+                calls.pop(token, None)
+                if not calls and self._BACKGROUND_CALLS.get(key) is calls:
+                    self._BACKGROUND_CALLS.pop(key, None)
+                    self._BACKGROUND_SKIPS.pop(key, None)
 
     def _forget_background_future(self, future: Future) -> None:
         with self._sync_executor_lock:
