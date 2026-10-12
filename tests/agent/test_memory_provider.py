@@ -543,9 +543,11 @@ class TestMemoryManager:
             worker.join(timeout=5.0)
         assert results == {"a": "session a memory", "b": "session b memory"}
 
-    def test_one_stuck_call_returning_does_not_reopen_while_another_is_stuck(self):
+    def test_one_stuck_call_returning_does_not_reopen_while_another_is_stuck(self, monkeypatch):
         """Two sessions start a prefetch before either times out and both hang. When one of them
         finally returns, the other is still stuck, so fresh managers must keep skipping."""
+        import agent.memory_manager as mm_mod
+        from tests.waiting import wait_until
 
         class PerCallBlocking(FakeMemoryProvider):
             def __init__(self, name):
@@ -560,31 +562,38 @@ class TestMemoryManager:
                 gate.wait(timeout=5.0)
                 return ""
 
+        # The manager's clock, advanced by hand: a long real timeout keeps both calls inside their
+        # deadline however slowly the workers start, then the clock jump makes both overdue.
+        real_monotonic, skew = time.monotonic, [0.0]
+        monkeypatch.setattr(mm_mod, "time", SimpleNamespace(monotonic=lambda: real_monotonic() + skew[0]))
+        timeout = 60.0
         provider = PerCallBlocking("two-stuck")
-        mgr_a = MemoryManager(external_prefetch_timeout=0.3)
+        mgr_a = MemoryManager(external_prefetch_timeout=timeout)
         mgr_a.add_provider(provider)
-        mgr_b = MemoryManager(external_prefetch_timeout=0.3)
+        mgr_b = MemoryManager(external_prefetch_timeout=timeout)
         mgr_b.add_provider(provider)
-        workers = [threading.Thread(target=m.prefetch_all, args=(q,)) for m, q in ((mgr_a, "a"), (mgr_b, "b"))]
+        workers = [threading.Thread(target=m.prefetch_all, args=(q,), daemon=True)
+                   for m, q in ((mgr_a, "a"), (mgr_b, "b"))]
+        key = (mgr_a._home_key, provider.name)
         try:
             for w in workers:
                 w.start()
-            for w in workers:
-                w.join(timeout=5.0)
-            assert sorted(provider.prefetch_queries) == ["a", "b"]  # both started, both timed out
+            wait_until(lambda: len(provider.gates) == 2, what="both prefetch calls in flight")
+            assert sorted(provider.prefetch_queries) == ["a", "b"]
+            skew[0] = timeout + 1.0  # both calls are now past their deadline
 
             provider.gates[0].set()  # one stuck call returns; the other is still hung
-            deadline = time.monotonic() + 2.0
-            while len(MemoryManager._EXTERNAL_PREFETCH_THREADS.get((mgr_a._home_key, provider.name), {})) > 1:
-                assert time.monotonic() < deadline
-                time.sleep(0.01)
-            fresh = MemoryManager(external_prefetch_timeout=0.3)
+            wait_until(lambda: len(MemoryManager._EXTERNAL_PREFETCH_THREADS.get(key, {})) == 1,
+                       what="the returned call to clear its own registry entry")
+            fresh = MemoryManager(external_prefetch_timeout=timeout)
             fresh.add_provider(provider)
-            fresh.prefetch_all("c")
+            assert fresh.prefetch_all("c") == ""
             assert sorted(provider.prefetch_queries) == ["a", "b"]  # "c" was skipped, not spawned
         finally:
             for gate in provider.gates:
                 gate.set()
+            for w in workers:
+                w.join(timeout=5.0)
 
     def test_failed_prefetch_thread_start_leaves_no_registry_entry(self, monkeypatch):
         """A thread that never started can't clear its own entry; it must not gate the provider."""
