@@ -965,12 +965,9 @@ class AIAgent(
         # MemoryManager with fresh provider instances. api_server's parked managers
         # are checked out exclusively, so a live shared manager is never reachable
         # here; delegation/review children run skip_memory=True (manager is None).
-        try:
-            _mm = getattr(self, "_memory_manager", None)
-            if _mm is not None and not getattr(_mm, "_shutting_down", False):
-                _quietly(_mm.shutdown_all)
-        except Exception:
-            pass
+        _mm = getattr(self, "_memory_manager", None)
+        if _mm is not None and not getattr(_mm, "_shutting_down", False):
+            _quietly(_mm.shutdown_all)
 
     def close(self) -> None:
         """Release every resource this agent holds (idempotent); each phase is guarded so one failure never
