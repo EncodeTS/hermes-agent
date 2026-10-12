@@ -680,6 +680,30 @@ class TestAgentCacheIdleResume:
         assert events == ["shutdown"]
         assert not provider.writer.is_alive()
 
+    def test_close_racing_an_in_progress_soft_release_does_not_reextract(self):
+        """close() arriving while release_clients() is still inside the provider shutdown must not
+        start extraction or a second shutdown against the providers being torn down."""
+        events = []
+        agent, provider = self._agent_with_writer_provider("mem-release-race-test", events)
+        in_shutdown, let_finish = threading.Event(), threading.Event()
+        real_shutdown = provider.shutdown
+
+        def slow_shutdown():
+            in_shutdown.set()
+            assert let_finish.wait(5)
+            real_shutdown()
+
+        provider.shutdown = slow_shutdown
+        releaser = threading.Thread(target=agent.release_clients)
+        releaser.start()
+        try:
+            assert in_shutdown.wait(5)
+            agent.close()
+        finally:
+            let_finish.set()
+            releaser.join(timeout=5)
+        assert events == ["shutdown"]
+
     def test_gateway_soft_evict_commits_memory_before_provider_shutdown(self):
         """The sweep eviction path must run end-of-session extraction BEFORE release_clients()
         shuts the providers down (a shut-down provider can no longer commit)."""

@@ -969,8 +969,10 @@ class AIAgent(
         # here; delegation/review children run skip_memory=True (manager is None).
         _mm = getattr(self, "_memory_manager", None)
         if _mm is not None and not getattr(_mm, "_shutting_down", False):
-            _quietly(_mm.shutdown_all)
+            # Claimed before the (bounded, seconds-long) drain so a close() racing it skips the
+            # extraction and second provider shutdown instead of running them mid-teardown.
             self._memory_providers_released = True
+            _quietly(_mm.shutdown_all)
 
     def close(self) -> None:
         """Release every resource this agent holds (idempotent); each phase is guarded so one failure never
