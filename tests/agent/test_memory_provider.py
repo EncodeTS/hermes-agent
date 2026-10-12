@@ -480,8 +480,8 @@ class TestMemoryManager:
 
         deadline = time.monotonic() + 1.0
         while (
-            external.name in mgr._EXTERNAL_PREFETCH_THREADS
-            and mgr._EXTERNAL_PREFETCH_THREADS[external.name].is_alive()
+            (mgr._home_key, external.name) in mgr._EXTERNAL_PREFETCH_THREADS
+            and mgr._EXTERNAL_PREFETCH_THREADS[(mgr._home_key, external.name)].is_alive()
             and time.monotonic() < deadline
         ):
             time.sleep(0.01)
@@ -490,7 +490,7 @@ class TestMemoryManager:
 
         assert result == "builtin memory\n\nlate external memory"
         assert external.prefetch_queries == ["query", "query 3"]
-        assert external.name not in mgr._EXTERNAL_PREFETCH_THREADS
+        assert (mgr._home_key, external.name) not in mgr._EXTERNAL_PREFETCH_THREADS
 
     def test_stuck_prefetch_thread_is_shared_across_managers(self):
         """#134392: a new MemoryManager is built per agent init, so the in-flight
@@ -510,8 +510,48 @@ class TestMemoryManager:
             ]
             assert len(live) == 1
             assert external.prefetch_queries == ["query"]
+
+            # Once the stuck call returns, the shared registry clears and a fresh
+            # manager prefetches again.
+            external.release.set()
+            live[0].join(timeout=2.0)
+            assert not live[0].is_alive()
+            assert (mgr._home_key, external.name) not in MemoryManager._EXTERNAL_PREFETCH_THREADS
+            mgr = MemoryManager(external_prefetch_timeout=1.0)
+            mgr.add_provider(external)
+            mgr._prefetch_provider(external, "after", session_id="s-after")
+            assert external.prefetch_queries == ["query", "after"]
         finally:
             external.release.set()
+
+    def test_stuck_prefetch_registry_is_scoped_per_hermes_home(self, tmp_path):
+        """Two profiles served by one process may configure a same-named provider
+        against different backends; a hung call in one must not suppress the other.
+        """
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        stuck = BlockingPrefetchProvider("per-home-stuck")
+        other = FakeMemoryProvider("per-home-stuck")
+        other._prefetch_result = "profile b memory"
+        try:
+            token = set_hermes_home_override(tmp_path / "profile-a")
+            try:
+                mgr_a = MemoryManager(external_prefetch_timeout=0.01)
+            finally:
+                reset_hermes_home_override(token)
+            mgr_a.add_provider(stuck)
+            assert mgr_a._prefetch_provider(stuck, "q", session_id="a") == ""
+
+            token = set_hermes_home_override(tmp_path / "profile-b")
+            try:
+                mgr_b = MemoryManager(external_prefetch_timeout=1.0)
+            finally:
+                reset_hermes_home_override(token)
+            mgr_b.add_provider(other)
+            assert mgr_b._home_key != mgr_a._home_key
+            assert mgr_b._prefetch_provider(other, "q", session_id="b") == "profile b memory"
+        finally:
+            stuck.release.set()
 
 
 class TestPluginMemoryDiscovery:

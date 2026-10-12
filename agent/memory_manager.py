@@ -20,6 +20,7 @@ from agent.redact import redact_for_egress
 
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
 from agent.skill_commands import extract_user_instruction_from_skill_message
+from hermes_constants import hermes_home_key
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
 from tools.registry import tool_error
 
@@ -395,12 +396,15 @@ class MemoryManager:
     swallows per-provider exceptions.
     """
 
-    # Process-wide registry of in-flight external prefetch threads, keyed by provider
-    # name. A new MemoryManager is built per agent init, so a per-instance registry
-    # would let every fresh manager spawn one more stuck thread against the same
-    # provider (#134392); shared, a stuck call suppresses new spawns from any manager
-    # until it returns.
-    _EXTERNAL_PREFETCH_THREADS: dict[str, threading.Thread] = {}
+    # Process-wide registry of in-flight external prefetch threads, keyed by
+    # (Hermes home, provider name). A new MemoryManager is built per agent init, so a
+    # per-instance registry would let every fresh manager spawn one more stuck thread
+    # against the same provider (#134392); shared, a stuck call suppresses new spawns
+    # from any manager until it returns. The home is part of the key because one
+    # gateway process can serve several profiles, each with its own config and
+    # credentials for a same-named provider: one profile's hung backend must not
+    # silence another's recall.
+    _EXTERNAL_PREFETCH_THREADS: dict[tuple[str, str], threading.Thread] = {}
     _EXTERNAL_PREFETCH_LOCK = threading.Lock()
 
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
@@ -413,6 +417,8 @@ class MemoryManager:
         if timeout <= 0:
             raise ValueError("external_prefetch_timeout must be positive")
         self._external_prefetch_timeout = timeout
+        # Captured at build time, inside the profile scope the agent is built for.
+        self._home_key = hermes_home_key()
         # Single-worker background executor for end-of-turn sync/prefetch, created lazily so
         # the builtin-only path spawns no threads; one worker serializes a provider's writes.
         self._sync_executor: Optional[ThreadPoolExecutor] = None
@@ -533,19 +539,27 @@ class MemoryManager:
 
         result_box: dict[str, Any] = {}
 
+        key = (self._home_key, provider.name)
+
         def _run() -> None:
             try:
                 result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 result_box["error"] = exc
+            finally:
+                # A timed-out call clears its own entry when it finally returns, so the
+                # process-wide registry never pins a finished thread.
+                with self._EXTERNAL_PREFETCH_LOCK:
+                    if self._EXTERNAL_PREFETCH_THREADS.get(key) is thread:
+                        self._EXTERNAL_PREFETCH_THREADS.pop(key, None)
 
         thread = spawn_context_thread(_run, name=f"memory-prefetch-{provider.name}")
         with self._EXTERNAL_PREFETCH_LOCK:
-            existing = self._EXTERNAL_PREFETCH_THREADS.get(provider.name)
+            existing = self._EXTERNAL_PREFETCH_THREADS.get(key)
             if existing is not None and existing.is_alive():
                 logger.debug("Memory provider '%s' prefetch is still running; skipping this turn", provider.name)
                 return ""
-            self._EXTERNAL_PREFETCH_THREADS[provider.name] = thread
+            self._EXTERNAL_PREFETCH_THREADS[key] = thread
             thread.start()
 
         thread.join(self._external_prefetch_timeout)
@@ -557,8 +571,8 @@ class MemoryManager:
             return ""
 
         with self._EXTERNAL_PREFETCH_LOCK:
-            if self._EXTERNAL_PREFETCH_THREADS.get(provider.name) is thread:
-                self._EXTERNAL_PREFETCH_THREADS.pop(provider.name, None)
+            if self._EXTERNAL_PREFETCH_THREADS.get(key) is thread:
+                self._EXTERNAL_PREFETCH_THREADS.pop(key, None)
         if "error" in result_box:
             raise result_box["error"]
         result = result_box.get("value", "")
