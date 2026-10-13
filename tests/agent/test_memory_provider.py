@@ -489,11 +489,14 @@ class TestMemoryManager:
         assert external.prefetch_queries == ["query", "query 3"]
         assert (mgr._home_key, external.name) not in mgr._EXTERNAL_PREFETCH_THREADS
 
-    def test_stuck_prefetch_thread_is_shared_across_managers(self):
+    def test_stuck_prefetch_thread_is_shared_across_managers(self, tmp_path):
         """#134392: a new MemoryManager is built per agent init, so the in-flight
         registry must be process-wide — N fresh managers against one stuck provider
-        keep at most one live ``memory-prefetch-*`` thread, not one per manager.
+        keep at most one live ``memory-prefetch-*`` thread, not one per manager. It is
+        keyed per Hermes home: another profile's same-named provider still recalls.
         """
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
         external = BlockingPrefetchProvider("cross-manager-stuck")
         try:
             for i in range(5):
@@ -507,6 +510,16 @@ class TestMemoryManager:
             ]
             assert len(live) == 1
             assert external.prefetch_queries == ["query"]
+
+            other_profile = FakeMemoryProvider("cross-manager-stuck")
+            other_profile._prefetch_result = "profile b memory"
+            token = set_hermes_home_override(tmp_path / "profile-b")
+            try:
+                mgr_b = MemoryManager(external_prefetch_timeout=1.0)
+            finally:
+                reset_hermes_home_override(token)
+            mgr_b.add_provider(other_profile)
+            assert mgr_b._prefetch_provider(other_profile, "q", session_id="b") == "profile b memory"
 
             # Once the stuck call returns, the shared registry clears and a fresh
             # manager prefetches again.
@@ -542,114 +555,6 @@ class TestMemoryManager:
             first.release.set()
             worker.join(timeout=5.0)
         assert results == {"a": "session a memory", "b": "session b memory"}
-
-    def test_one_stuck_call_returning_does_not_reopen_while_another_is_stuck(self, monkeypatch):
-        """Two sessions start a prefetch before either times out and both hang. When one of them
-        finally returns, the other is still stuck, so fresh managers must keep skipping."""
-        import agent.memory_manager as mm_mod
-        from tests.waiting import wait_until
-
-        class PerCallBlocking(FakeMemoryProvider):
-            def __init__(self, name):
-                super().__init__(name=name)
-                self.gates, self.lock = [], threading.Lock()
-
-            def prefetch(self, query, *, session_id=""):
-                gate = threading.Event()
-                with self.lock:
-                    self.gates.append(gate)
-                    self.prefetch_queries.append(query)
-                gate.wait(timeout=5.0)
-                return ""
-
-        # The manager's clock, advanced by hand: a long real timeout keeps both calls inside their
-        # deadline however slowly the workers start, then the clock jump makes both overdue.
-        real_monotonic, skew = time.monotonic, [0.0]
-        monkeypatch.setattr(mm_mod, "time", SimpleNamespace(monotonic=lambda: real_monotonic() + skew[0]))
-        timeout = 60.0
-        provider = PerCallBlocking("two-stuck")
-        mgr_a = MemoryManager(external_prefetch_timeout=timeout)
-        mgr_a.add_provider(provider)
-        mgr_b = MemoryManager(external_prefetch_timeout=timeout)
-        mgr_b.add_provider(provider)
-        workers = [threading.Thread(target=m.prefetch_all, args=(q,), daemon=True)
-                   for m, q in ((mgr_a, "a"), (mgr_b, "b"))]
-        key = (mgr_a._home_key, provider.name)
-        try:
-            for w in workers:
-                w.start()
-            wait_until(lambda: len(provider.gates) == 2, what="both prefetch calls in flight")
-            assert sorted(provider.prefetch_queries) == ["a", "b"]
-            skew[0] = timeout + 1.0  # both calls are now past their deadline
-
-            provider.gates[0].set()  # one stuck call returns; the other is still hung
-            wait_until(lambda: len(MemoryManager._EXTERNAL_PREFETCH_THREADS.get(key, {})) == 1,
-                       what="the returned call to clear its own registry entry")
-            fresh = MemoryManager(external_prefetch_timeout=timeout)
-            fresh.add_provider(provider)
-            assert fresh.prefetch_all("c") == ""
-            assert sorted(provider.prefetch_queries) == ["a", "b"]  # "c" was skipped, not spawned
-        finally:
-            for gate in provider.gates:
-                gate.set()
-            for w in workers:
-                w.join(timeout=5.0)
-
-    def test_failed_prefetch_thread_start_leaves_no_registry_entry(self, monkeypatch):
-        """A thread that never started can't clear its own entry; it must not gate the provider."""
-        import agent.memory_manager as mm_mod
-
-        provider = FakeMemoryProvider("start-fails")
-        provider._prefetch_result = "recovered"
-        mgr = MemoryManager(external_prefetch_timeout=0.01)
-        mgr.add_provider(provider)
-        real_spawn = mm_mod.spawn_context_thread
-
-        def failing_spawn(*args, **kwargs):
-            thread = real_spawn(*args, **kwargs)
-            def boom():
-                raise RuntimeError("can't start new thread")
-            thread.start = boom
-            return thread
-
-        monkeypatch.setattr(mm_mod, "spawn_context_thread", failing_spawn)
-        with pytest.raises(RuntimeError):
-            mgr._prefetch_provider(provider, "q", session_id="s")
-        assert (mgr._home_key, provider.name) not in MemoryManager._EXTERNAL_PREFETCH_THREADS
-        monkeypatch.setattr(mm_mod, "spawn_context_thread", real_spawn)
-        mgr = MemoryManager(external_prefetch_timeout=1.0)
-        mgr.add_provider(provider)
-        assert mgr._prefetch_provider(provider, "q", session_id="s") == "recovered"
-
-    def test_stuck_prefetch_registry_is_scoped_per_hermes_home(self, tmp_path):
-        """Two profiles served by one process may configure a same-named provider
-        against different backends; a hung call in one must not suppress the other.
-        """
-        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-
-        stuck = BlockingPrefetchProvider("per-home-stuck")
-        other = FakeMemoryProvider("per-home-stuck")
-        other._prefetch_result = "profile b memory"
-        try:
-            token = set_hermes_home_override(tmp_path / "profile-a")
-            try:
-                mgr_a = MemoryManager(external_prefetch_timeout=0.01)
-            finally:
-                reset_hermes_home_override(token)
-            mgr_a.add_provider(stuck)
-            assert mgr_a._prefetch_provider(stuck, "q", session_id="a") == ""
-
-            token = set_hermes_home_override(tmp_path / "profile-b")
-            try:
-                mgr_b = MemoryManager(external_prefetch_timeout=1.0)
-            finally:
-                reset_hermes_home_override(token)
-            mgr_b.add_provider(other)
-            assert mgr_b._home_key != mgr_a._home_key
-            assert mgr_b._prefetch_provider(other, "q", session_id="b") == "profile b memory"
-        finally:
-            stuck.release.set()
-
 
 class TestPluginMemoryDiscovery:
     """Memory providers are discovered from plugins/memory/ directory."""

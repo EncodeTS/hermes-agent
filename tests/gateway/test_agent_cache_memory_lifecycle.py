@@ -65,23 +65,11 @@ class TestAgentCacheMemoryLifecycle:
         events = []
         agent, provider = self._agent_with_writer_provider("mem-writer-evict-test", events)
         assert provider.writer.is_alive()
-        try:
-            agent.release_clients()
-            agent.release_clients()  # idempotent: the teardown claim is once-only
-            assert not provider.writer.is_alive()
-            assert events == ["shutdown"]
-        finally:
-            agent.close()
-
-    def test_close_after_release_clients_does_not_reextract_or_reshutdown(self):
-        """A soft-released agent that is later close()d (e.g. a reset racing an eviction) must not run
-        end-of-session extraction against, or shut down a second time, providers already shut down."""
-        events = []
-        agent, provider = self._agent_with_writer_provider("mem-release-then-close-test", events)
         agent.release_clients()
-        agent.close()
-        assert events == ["shutdown"]
+        agent.release_clients()  # idempotent: the teardown claim is once-only
         assert not provider.writer.is_alive()
+        agent.close()  # a later hard close neither re-extracts nor shuts down twice
+        assert events == ["shutdown"]
 
     def test_close_racing_an_in_progress_soft_release_does_not_reextract(self):
         """close() arriving while release_clients() is still inside the provider shutdown must not

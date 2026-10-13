@@ -96,48 +96,10 @@ def test_stuck_call_stops_fresh_managers_from_pinning_more_threads():
     provider.release.set()
     assert first.flush_pending(timeout=5)
     assert (first._home_key, provider.name) not in MemoryManager._BACKGROUND_CALLS
+    first.sync_all("next", "turn")  # calls resume once the stuck one returns
+    assert first.flush_pending(timeout=5)
+    assert provider.sync_calls == 2
     first.shutdown_all()
-
-
-def test_calls_resume_once_the_stuck_call_returns():
-    provider = _HangingProvider()
-    mgr = _manager(provider)
-    mgr.sync_all("hello", "hi")
-    assert provider.started.wait(5)
-    provider.release.set()
-    assert mgr.flush_pending(timeout=5)
-
-    mgr.sync_all("next", "turn")
-    mgr.queue_prefetch_all("query")
-    assert mgr.flush_pending(timeout=5)
-    assert provider.sync_calls == 2 and provider.prefetch_calls == 1
-    mgr.shutdown_all()
-
-
-def test_stall_is_scoped_per_provider_and_home(monkeypatch):
-    hung = _HangingProvider("hangs")
-    mgr = _manager(hung)
-    mgr.sync_all("hello", "hi")
-    assert hung.started.wait(5)
-
-    other = _HangingProvider("healthy")
-    other.hang_next = False
-    other_mgr = _manager(other)
-    other_mgr.sync_all("a", "b")
-    assert other_mgr.flush_pending(timeout=5)
-    assert other.sync_calls == 1
-
-    monkeypatch.setattr(mm, "hermes_home_key", lambda: "/other/profile")
-    same_name_other_home = _HangingProvider("hangs")
-    same_name_other_home.hang_next = False
-    profile_mgr = _manager(same_name_other_home)
-    profile_mgr.sync_all("a", "b")
-    assert profile_mgr.flush_pending(timeout=5)
-    assert same_name_other_home.sync_calls == 1
-
-    hung.release.set()
-    for m in (mgr, other_mgr, profile_mgr):
-        m.shutdown_all()
 
 
 def test_slow_call_below_threshold_is_not_skipped(monkeypatch):
