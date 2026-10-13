@@ -154,21 +154,6 @@ def _quietly(fn: Callable, *args, **kwargs) -> None:
         pass
 
 
-_MEMORY_TEARDOWN_CLAIM_LOCK = threading.Lock()
-
-
-def _claim_memory_teardown(agent: Any) -> bool:
-    """Once-only claim on an agent's memory-provider teardown, shared by end-of-session shutdown
-    and soft release. A /new cleanup worker left running past its timeout can still be inside
-    ``on_session_end()`` when the same agent is evicted; the loser skips, so extraction and
-    ``shutdown_all()`` never run concurrently or twice."""
-    with _MEMORY_TEARDOWN_CLAIM_LOCK:
-        if getattr(agent, "_memory_teardown_claimed", False):
-            return False
-        agent._memory_teardown_claimed = True
-        return True
-
-
 def _call_engine_hook(engine: Any, hook: str, *args, **kwargs) -> None:
     """Invoke an optional context-engine lifecycle hook; failures are logged, never raised."""
     if not hasattr(engine, hook):
@@ -889,9 +874,8 @@ class AIAgent(
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
-        # One claim shared with release_clients(): whichever path claims first owns extraction and
-        # shutdown_all(); the other skips, so they never overlap or shut providers down twice.
-        if self._memory_manager and _claim_memory_teardown(self):
+        # Shared with release_clients() via the manager's once-only claim (see claim_teardown).
+        if self._memory_manager and self._memory_manager.claim_teardown(session_end=True):
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception as e:
@@ -952,42 +936,11 @@ class AIAgent(
         # The Codex app-server child is an LLM client, not session tool state: the evicted instance is popped
         # from the cache and a rebuilt agent spawns its own child, so an unclosed one leaks for the gateway's life.
         _quietly(self._close_codex_session)
-        # Drain + shut down memory providers WITHOUT on_session_end().
-        #
-        # Each memory provider instance spawns its own background writer thread
-        # (retaindb-writer, openviking-sync, ...). Soft eviction never terminated
-        # them: one zombie daemon per evicted agent, each holding stack memory and
-        # references to provider clients/queues that block GC. Under a 128-entry
-        # cache with heavy turnover (e.g. concurrent 429 retry storms) this piles
-        # up dozens of leaked threads and drove the 2026-07-30 gateway liveness
-        # crash (exit 75).
-        #
-        # shutdown_memory_provider() calls on_session_end() first — too heavy for
-        # soft eviction: it triggers end-of-session extraction, which a resumed
-        # session would duplicate. Instead call shutdown_all() directly: it
-        # bounded-drains the sync executor (giving any queued extraction its ~5s)
-        # and calls provider shutdown(), which sends each writer its sentinel and
-        # joins the thread — no extraction side-effect.
-        #
-        # Extraction-commit coverage varies by eviction path: the sweep paths
-        # (LRU cap, idle TTL, RSS pressure) commit via _commit_then_release_soft()
-        # before soft release; direct eviction paths (/new, /model, /login,
-        # cross-process) release without a pre-commit, so on those the manager's
-        # queue still drains but the final turn's extraction is not committed —
-        # pre-existing behavior, unchanged by this fix (before this PR those
-        # paths ALSO leaked the writer threads).
-        #
-        # Safe for resume: an evicted agent is popped from the cache and never
-        # re-added, and the resumed session's freshly-built AIAgent creates a new
-        # MemoryManager with fresh provider instances. api_server's parked managers
-        # are checked out exclusively, so a live shared manager is never reachable
-        # here; delegation/review children run skip_memory=True (manager is None).
+        # Stop the memory providers' writer threads (one leaked per evicted agent otherwise), but skip
+        # on_session_end(): sweep evictions already committed it via _commit_then_release_soft(), and a
+        # pending end-of-session teardown (claim_teardown) owns both extraction and shutdown.
         _mm = getattr(self, "_memory_manager", None)
-        # Claimed before the (bounded, seconds-long) drain, and shared with shutdown_memory_provider():
-        # a /new cleanup still inside on_session_end() holds the claim, so this eviction leaves the
-        # shutdown to that worker instead of tearing the providers down under its extraction. A manager
-        # already draining (shut down by another owner) is left alone too.
-        if _mm is not None and not getattr(_mm, "_shutting_down", False) and _claim_memory_teardown(self):
+        if _mm is not None and _mm.claim_teardown(session_end=False):
             _quietly(_mm.shutdown_all)
 
     def close(self) -> None:

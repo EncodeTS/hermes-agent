@@ -343,6 +343,7 @@ class MemoryManager:
         # within a bound, then report exactly what it abandoned.
         self._background_futures: dict[Future, str] = {}
         self._shutting_down = False
+        self._teardown_claim: Optional[str] = None  # see claim_teardown()
         self._shutdown_drain_state: dict[str, Any] = {
             "status": "not_started", "abandoned_writes": 0, "abandoned_prefetches": 0, "active_tasks": 0,
         }
@@ -917,6 +918,18 @@ class MemoryManager:
             "on_delegation failed",
             lambda p: p.on_delegation(task, result, child_session_id=child_session_id, **kwargs),
         )
+
+    def claim_teardown(self, *, session_end: bool) -> bool:
+        """Claim extraction + ``shutdown_all()`` for end-of-session shutdown or soft release. The first
+        claimer wins and the loser skips, so the two never overlap and providers (no idempotency
+        contract) are never shut down twice. Session-end callers may re-claim (the gateway claims before
+        its flush, then ``shutdown_memory_provider`` claims again); a soft release is once-only and also
+        loses to a manager another owner is already draining."""
+        with self._sync_executor_lock:
+            if self._teardown_claim is None and (session_end or not self._shutting_down):
+                self._teardown_claim = "session_end" if session_end else "soft_release"
+                return True
+            return session_end and self._teardown_claim == "session_end"
 
     def shutdown_all(self) -> None:
         """Drain the background executor (bounded), then shut providers down in reverse order."""
