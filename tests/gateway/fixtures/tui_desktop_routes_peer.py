@@ -192,7 +192,29 @@ async def _commands(authority, ws, reader, sid, marker, receipt):
     receipt['commands'] = True
 
 
-MODES = {'react': _react, 'control': _control, 'commands': _commands}
+async def _control_refusals(authority, ws, reader, sid, marker, receipt):
+    """RT-8: a criterion button that cannot act is a refusal the card shows, never a success envelope."""
+    from tests.gateway.fixtures.local_recovery_probe import rpc
+
+    async def control(action, **args):
+        return await rpc(ws, 'session.control', session_id=sid, action=action, args=args)
+
+    def refused(reply, reason):
+        assert 'result' not in reply, reply
+        assert _error(reply) == reason and reply['error']['data'].get('detail'), reply
+
+    refused(await control('subgoal.add', text='write the release notes'), 'goal_not_active')
+    refused(await control('subgoal.clear'), 'goal_not_active')
+    assert 'result' in await rpc(ws, 'slash.exec', session_id=sid, command='goal ship the owned fixture')
+    added = await control('subgoal.add', text='cite the changelog')
+    assert added['result']['control']['goal']['subgoals'] == ['cite the changelog'], added
+    refused(await control('subgoal.remove', index=2), 'invalid_params')
+    read = await rpc(ws, 'session.control.read', session_id=sid)
+    assert read['result']['control']['goal']['subgoals'] == ['cite the changelog'], read
+    receipt['refused'] = True
+
+
+MODES = {'react': _react, 'control': _control, 'control_refusals': _control_refusals, 'commands': _commands}
 
 
 if __name__ == '__main__':
