@@ -659,13 +659,19 @@ function beginAction(sessionId: string, action: SessionControlAction): number {
   return token
 }
 
+// A gateway refusal carries its reason code as the message and the human reason as data.detail.
+function refusalDetail(error: unknown): string {
+  return isRecord(error) && isRecord(error.data) && typeof error.data.detail === 'string' ? error.data.detail : ''
+}
+
 function boundedError(error: unknown): string {
   const message =
-    error instanceof Error
+    refusalDetail(error) ||
+    (error instanceof Error
       ? error.message
       : isRecord(error) && typeof error.message === 'string'
         ? error.message
-        : 'Session control request failed'
+        : 'Session control request failed')
 
   return message.trim().slice(0, ERROR_LIMIT) || 'Session control request failed'
 }
@@ -858,7 +864,9 @@ export async function runSessionControlAction(
       publishFailure(sessionId, token, error, true)
     }
 
-    throw error
+    const detail = refusalDetail(error)
+
+    throw detail ? new Error(detail, { cause: error }) : error
   }
 }
 
