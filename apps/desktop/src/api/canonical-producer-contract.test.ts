@@ -192,7 +192,7 @@ const SITES: Array<[string, string, Record<string, unknown>, string[] | RegExp]>
     ['session.mutate']
   ],
   [
-    'connector-tool.tsx in-chat connect (the card\'s Try again)',
+    "connector-tool.tsx in-chat connect (the card's Try again)",
     'connectors.connect',
     { connectors: ['gh'], owner: { session_id: 's', type: 'session' }, reconnect: true },
     // RT-2: the owner serves the card's calls (gateway/session_connections.py), so they travel as themselves.

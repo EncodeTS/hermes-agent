@@ -94,26 +94,32 @@ const SITES: [string, () => Promise<void>][] = [
     }
   ],
   [
-    'agentControls::sendAgentSteer is the owner\'s subagent.steer',
+    "agentControls::sendAgentSteer is the owner's subagent.steer",
     async () => {
       const { gw, request } = owner(method => (method === 'subagent.steer' ? { status: 'queued' } : {}))
       const result = await sendAgentSteer(gw, 'owner', 'c1', 'check tests')
       expect(result.accepted).toBe(true)
-      expect(request).toHaveBeenCalledWith('subagent.steer', { session_id: 'owner', subagent_id: 'c1', text: 'check tests' })
+      expect(request).toHaveBeenCalledWith('subagent.steer', {
+        session_id: 'owner',
+        subagent_id: 'c1',
+        text: 'check tests'
+      })
       expect(sidecarCalls(request)).toEqual([])
     }
   ],
   [
-    'agentsOverlay::killOne (x) is the owner\'s subagent.interrupt',
+    "agentsOverlay::killOne (x) is the owner's subagent.interrupt",
     async () => {
       const { gw, request } = owner(method => (method === 'subagent.interrupt' ? { found: true } : {}))
       await overlayKey(gw, 'x', 'c1')
-      await vi.waitFor(() => expect(request).toHaveBeenCalledWith('subagent.interrupt', { session_id: 'owner', subagent_id: 'c1' }))
+      await vi.waitFor(() =>
+        expect(request).toHaveBeenCalledWith('subagent.interrupt', { session_id: 'owner', subagent_id: 'c1' })
+      )
       expect(sidecarCalls(request)).toEqual([])
     }
   ],
   [
-    'agentsOverlay::killSubtree (X) is the owner\'s subagent.interrupt',
+    "agentsOverlay::killSubtree (X) is the owner's subagent.interrupt",
     async () => {
       const { gw, request } = owner(method => (method === 'subagent.interrupt' ? { found: true } : {}))
       await overlayKey(gw, 'X', 'killing')
