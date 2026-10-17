@@ -126,3 +126,22 @@ def test_restore_puts_the_agents_callbacks_back(window):
     for attr in local_desktop_ui.CALLBACK_ATTRS:
         assert getattr(window.agent, attr) is None
     assert local_desktop_ui._turns == {}
+
+
+def test_the_connection_card_opens_and_updates_on_the_owning_session(window, monkeypatch):
+    from tools.connectors import live
+    from tools.connectors.contract import Actor, TargetState
+    from tools.connectors.operation import ConnectionOperation, Target
+
+    monkeypatch.setattr(live, "_open", {})
+    local_viewer_events.wire(window.turn, window.agent)
+    operation = ConnectionOperation([Target("linear", "mcp", "install")], session_key="agent:main:local:dm:1")
+    live.open(operation)
+    assert window.agent.connection_callback(operation.request_payload()) is None
+    assert window.published[-1][0] == "connection.request"
+    assert window.published[-1][1]["op_id"] == operation.op_id
+    operation.transition("linear", TargetState.skipped, Actor.user)
+    session_id, event_type, payload = window.streamed[-1]
+    assert (session_id, event_type) == ("canon", "connection.update")
+    assert payload["owner"] == {"type": "session", "session_id": "canon"}
+    assert payload["targets"][0]["state"] == "skipped"

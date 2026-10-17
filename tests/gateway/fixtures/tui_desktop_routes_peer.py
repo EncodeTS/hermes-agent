@@ -214,7 +214,36 @@ async def _control_refusals(authority, ws, reader, sid, marker, receipt):
     receipt['refused'] = True
 
 
-MODES = {'react': _react, 'control': _control, 'control_refusals': _control_refusals, 'commands': _commands}
+async def _connection_card(authority, ws, reader, sid, marker, receipt):
+    """RT-2: the manage_connections card's calls reach the session's own open operation."""
+    from pathlib import Path
+    from tests.gateway.fixtures.local_recovery_probe import rpc
+    from gateway.run import _profile_runtime_scope
+    from tools.connectors import live
+    from tools.connectors.operation import ConnectionOperation, Target
+
+    owner = {'type': 'session', 'session_id': sid}
+    with _profile_runtime_scope(Path(authority.profile_id)):
+        operation = ConnectionOperation([Target('linear', 'mcp', 'install')], session_key=authority.sessions[sid].route)
+        live.open(operation)
+    status = await rpc(ws, 'connectors.operation.status', owner=owner, op_id=operation.op_id)
+    assert status.get('result', {}).get('op_id') == operation.op_id, status
+    assert (await rpc(ws, 'connectors.operation.wake', owner=owner, op_id=operation.op_id)).get('result') == {'status': 'ok'}
+    answered = await rpc(ws, 'connection.respond', owner=owner, op_id=operation.op_id,
+                         result={'targets': [{'name': 'linear', 'status': 'skipped'}]})
+    assert answered.get('result') == {'status': 'ok', 'settled': True}, answered
+    assert operation.settled and operation.target('linear').state.value == 'skipped'
+    retried = await rpc(ws, 'connectors.connect', owner=owner, connectors=['linear'], reconnect=True)
+    assert _error(retried) == 'unknown_operation', retried
+    missing = await rpc(ws, 'connection.respond', owner=owner, op_id='no-such-op', result={'targets': []})
+    assert _error(missing) == 'unknown_operation', missing
+    denied = await _call(reader, 'connection.respond', owner=owner, op_id='no-such-op', result={'targets': []})
+    assert _error(denied) == 'permission_denied', denied
+    receipt['card'] = True
+
+
+MODES = {'react': _react, 'control': _control, 'control_refusals': _control_refusals, 'commands': _commands,
+         'connection_card': _connection_card}
 
 
 if __name__ == '__main__':
