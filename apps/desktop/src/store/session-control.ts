@@ -1,3 +1,4 @@
+import { JsonRpcGatewayError } from '@hermes/shared'
 import { atom } from 'nanostores'
 
 import { $gateway } from './gateway'
@@ -659,14 +660,25 @@ function beginAction(sessionId: string, action: SessionControlAction): number {
   return token
 }
 
+interface GatewayRefusalData {
+  detail?: string
+}
+
 // A gateway refusal carries its reason code as the message and the human reason as data.detail.
-function refusalDetail(error: unknown): string {
-  return isRecord(error) && isRecord(error.data) && typeof error.data.detail === 'string' ? error.data.detail : ''
+function refusalDetail(error: Error): string {
+  if (!(error instanceof JsonRpcGatewayError)) {
+    return ''
+  }
+
+  // SAFETY: `error.data` is the gateway's own refusal data (gateway/session_controls.py::_refusal_data); an absent detail reads as empty.
+  const data = (error.data ?? {}) as GatewayRefusalData
+
+  return data.detail ?? ''
 }
 
 function boundedError(error: unknown): string {
   const message =
-    refusalDetail(error) ||
+    (error instanceof Error ? refusalDetail(error) : '') ||
     (error instanceof Error
       ? error.message
       : isRecord(error) && typeof error.message === 'string'
@@ -864,7 +876,7 @@ export async function runSessionControlAction(
       publishFailure(sessionId, token, error, true)
     }
 
-    const detail = refusalDetail(error)
+    const detail = error instanceof Error ? refusalDetail(error) : ''
 
     throw detail ? new Error(detail, { cause: error }) : error
   }
