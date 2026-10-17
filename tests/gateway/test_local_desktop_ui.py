@@ -51,6 +51,9 @@ def window(monkeypatch):
     monkeypatch.setattr(local_desktop_ui, "_process_routes", {})
     monkeypatch.setattr(local_desktop_ui, "_emitter_installed", False)
     monkeypatch.setattr(local_desktop_ui, "_process_sinks_installed", False)
+    monkeypatch.setattr(local_desktop_ui, "_connection_hook_installed", False)
+    from tools.connectors.operation import ConnectionOperation
+    monkeypatch.setattr(ConnectionOperation, "on_change", None)
     monkeypatch.setattr(desktop_ui, "_emit", None)
     monkeypatch.setattr(process_registry, "on_output", None)
     monkeypatch.setattr(process_registry, "on_close", None)

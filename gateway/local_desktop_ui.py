@@ -22,9 +22,10 @@ execution stream, and the process sinks route by the process's ``session_key`` t
 session's event stream (a background process outlives the turn that started it). The callbacks
 are installed per turn on the cached agent and restored with the other turn sinks.
 
-Not bridged here: ``connection_callback`` (the manage_connections card). Its card answers through
-the ``connection.respond`` RPC, which the session authority does not serve yet, so installing the
-callback would show a card whose buttons go nowhere; the tool keeps its off-desktop result.
+Card for ``manage_connections``: ``connection_callback`` publishes ``connection.request`` on the turn,
+and each later change of an operation is published as ``connection.update`` on the session that owns
+it (looked up by its session key, the route); the card answers through ``connection.respond``
+(``gateway/session_connections.py``).
 """
 from __future__ import annotations
 
@@ -37,7 +38,8 @@ logger = logging.getLogger(__name__)
 
 # Agent attributes ``wire`` installs for one local-viewer turn (restored by ``local_viewer_events``).
 CALLBACK_ATTRS = ("read_terminal_callback", "read_preview_callback", "drive_preview_callback",
-                  "read_window_below_callback", "theme_callback", "tour_callback", "setup_beat_callback")
+                  "read_window_below_callback", "theme_callback", "tour_callback", "setup_beat_callback",
+                  "connection_callback")
 
 # main: tui_gateway/agent_callbacks.py ``_read_block`` budgets and tui_gateway/server.py's preview.act ladder.
 _TERMINAL_READ_TIMEOUT_S = 30
@@ -78,6 +80,7 @@ _tour_bridge: dict[str, str] = {}
 _process_routes: dict[str, tuple] = {}
 _emitter_installed = False
 _process_sinks_installed = False
+_connection_hook_installed = False
 
 
 def _emit(sid, event, payload) -> None:
@@ -128,6 +131,33 @@ def _install_process_sinks() -> None:
         process_registry.on_close = lambda session, pid: _publish_process(
             session, "terminal.close", {"process_id": pid})
     _process_sinks_installed = True
+
+
+def _install_connection_hook() -> None:
+    """``connection.update`` for an operation opened by one of our turns, on the session that owns it
+    (by session key, as for processes); any other operation keeps the hook installed before (the
+    sidecar's, for its own sessions)."""
+    global _connection_hook_installed
+    if _connection_hook_installed:
+        return
+    from tools.connectors.operation import ConnectionOperation
+    previous = ConnectionOperation.on_change
+
+    def on_change(operation, change, snapshot):
+        with _lock:
+            route = _process_routes.get(operation.session_key)
+        live = route[0].sessions.get(route[1]) if route is not None else None
+        if live is None:
+            if previous is not None:
+                previous(operation, change, snapshot)
+            return
+        from tui_gateway.connector_payload import connector_ui_payload
+        payload = {**snapshot, "settled": snapshot.get("settled_at") is not None, **(change or {}),
+                   "owner": {"type": "session", "session_id": route[1]}}
+        live.event_stream.publish(route[1], connector_ui_payload(payload), event_type="connection.update")
+
+    ConnectionOperation.on_change = staticmethod(on_change)
+    _connection_hook_installed = True
 
 
 def _ask_result(turn, agent, method, params, timeout):
@@ -231,6 +261,7 @@ def wire(turn, agent):
     try:
         _install_emitter()
         _install_process_sinks()
+        _install_connection_hook()
     except Exception:  # health: allow BLE001 -- the window bridges are optional; the turn must run
         logger.warning("Desktop UI sink install failed", exc_info=True)
     key = str(getattr(turn._ctx, "session_id", "") or owner[1])
@@ -247,6 +278,8 @@ def wire(turn, agent):
     agent.theme_callback = lambda payload: _theme(turn, agent, dict(payload or {}))
     agent.tour_callback = lambda payload: _tour(turn, agent, dict(payload or {}))
     agent.setup_beat_callback = lambda payload: _setup_beat(turn, agent, dict(payload or {}))
+    # Fire-and-forget like main's: the tool thread waits on its own operation, the card answers by op_id.
+    agent.connection_callback = lambda payload: publish("connection.request", dict(payload)) and None
     return key, publish
 
 

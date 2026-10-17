@@ -213,6 +213,8 @@ class AuthorityConnection:
         handlers['message.react'] = partial(react, self)
         from gateway.session_clarify_lock import clarify_lock
         handlers['clarify.lock'] = partial(clarify_lock, self)
+        from gateway.session_connections import handlers as connection_handlers
+        handlers.update(connection_handlers(self))
         from gateway.session_control_actions import control
         handlers['session.control'] = partial(control, self)
         return handlers
@@ -282,12 +284,14 @@ class AuthorityConnection:
             # launch profile's config into a served secondary's session. Under a single profile
             # the scope is that profile's own home, so behaviour is unchanged.
             from gateway.session_authorities import owner_scope
+            from gateway.session_connections import METHODS as CONNECTION_METHODS, session_owned
             with owner_scope(self.authority):
                 if method in GROUP_METHODS or method == 'profiles.list':
                     result = await dispatch_group_control(self, method, params)
-                elif method not in handlers:
+                elif method not in handlers or (method in CONNECTION_METHODS and not session_owned(params)):
                     # JSON-RPC's own verdict: clients key compat fallbacks on -32601, and a
                     # 4001 'invalid_params' would read as a bad argument on a method that exists.
+                    # An account-owned connector call (the Connectors page) keeps its legacy handler.
                     return {'jsonrpc': '2.0', 'id': rid, 'error': {
                         'code': -32601, 'message': f'unknown method: {method}',
                         'data': {'reason': 'unknown_method'}}}
