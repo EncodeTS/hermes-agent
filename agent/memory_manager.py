@@ -931,6 +931,14 @@ class MemoryManager:
                 return True
             return session_end and self._teardown_claim == "session_end"
 
+    def release_soft(self) -> None:
+        """Soft release (cache eviction, CLI agent rebuild): stop provider writer threads, which otherwise leak
+        one per evicted agent, WITHOUT on_session_end(): sweeps commit first and a pending session end owns
+        both. Flush first, since shutdown_all()'s short drain would cancel writes the old worker finished."""
+        if self.claim_teardown(session_end=False):
+            self.flush_pending(timeout=10)
+            self.shutdown_all()
+
     def shutdown_all(self) -> None:
         """Drain the background executor (bounded), then shut providers down in reverse order."""
         self._drain_sync_executor()

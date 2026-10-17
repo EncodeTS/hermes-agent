@@ -71,6 +71,30 @@ class TestAgentCacheMemoryLifecycle:
         agent.close()  # a later hard close neither re-extracts nor shuts down twice
         assert events == ["shutdown"]
 
+    def test_release_clients_lets_queued_writes_finish_before_shutdown(self, monkeypatch):
+        """Soft release must not cancel the retired agent's queued memory writes: on main the worker
+        finished them in the background, and shutdown_all()'s bounded drain alone would abandon them."""
+        import agent.memory_manager as mm
+        from tests.waiting import wait_until
+
+        monkeypatch.setattr(mm, "_SYNC_DRAIN_TIMEOUT_S", 0.0)
+        events = []
+        agent, provider = self._agent_with_writer_provider("mem-release-flush-test", events)
+        manager, gate, flushing = agent._memory_manager, threading.Event(), threading.Event()
+        provider.sync_turn = lambda user, assistant, **kw: (gate.wait(10), events.append(f"sync:{user}"))
+        real_flush = manager.flush_pending
+        manager.flush_pending = lambda timeout=None: (flushing.set(), real_flush(timeout))[1]
+        for turn in ("a", "b", "c"):
+            manager.sync_all(turn, "reply")
+        releaser = threading.Thread(target=agent.release_clients)
+        releaser.start()
+        try:
+            wait_until(lambda: flushing.is_set() or not releaser.is_alive(), what="the soft release to start")
+        finally:
+            gate.set()
+            releaser.join(timeout=10)
+        assert events == ["sync:a", "sync:b", "sync:c", "shutdown"]
+
     def test_close_racing_an_in_progress_soft_release_does_not_reextract(self):
         """close() arriving while release_clients() is still inside the provider shutdown must not
         start extraction or a second shutdown against the providers being torn down."""
