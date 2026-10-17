@@ -226,7 +226,10 @@ def _retire_agent(cli) -> None:
     cli.agent = None
     if agent is not None and hasattr(agent, "release_clients"):
         from agent.memory_provider import spawn_context_thread
-        spawn_context_thread(agent.release_clients, name="cli-agent-retire", daemon=False).start()
+        try:
+            spawn_context_thread(agent.release_clients, name="cli-agent-retire", daemon=False).start()
+        except RuntimeError:  # no new threads (interpreter shutting down): release inline
+            agent.release_clients()
 
 
 class CLIAgentSetupMixin:

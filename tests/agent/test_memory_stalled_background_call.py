@@ -3,13 +3,13 @@ stop a thread). MemoryManagers are rebuilt per agent, so without a process-wide 
 started one more call against the hung backend and pinned one more thread. Calls for a provider are now
 skipped while an earlier call for it is stuck past the stall threshold."""
 import threading
-import time
 
 import pytest
 
 import agent.memory_manager as mm
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
+from tests.waiting import wait_until
 
 
 class _HangingProvider(MemoryProvider):
@@ -63,8 +63,7 @@ def _short_stall(monkeypatch):
 
 def _manager(provider):
     mgr = MemoryManager()
-    mgr._providers.append(provider)
-    mgr._has_external = True
+    mgr.add_provider(provider)
     return mgr
 
 
@@ -88,10 +87,8 @@ def test_stuck_call_stops_fresh_managers_from_pinning_more_threads():
 
     assert provider.sync_calls == 1 and provider.prefetch_calls == 0
     assert MemoryManager._BACKGROUND_SKIPS[(first._home_key, provider.name)] == 10
-    deadline = time.monotonic() + 5  # idle workers of shut-down executors exit asynchronously
-    while len(_mem_sync_threads()) > before and time.monotonic() < deadline:
-        time.sleep(0.02)
-    assert len(_mem_sync_threads()) <= before
+    # Idle workers of shut-down executors exit asynchronously.
+    wait_until(lambda: len(_mem_sync_threads()) <= before, timeout=5, what="idle mem-sync workers to exit")
 
     provider.release.set()
     assert first.flush_pending(timeout=5)
