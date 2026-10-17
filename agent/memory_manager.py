@@ -296,6 +296,17 @@ def build_memory_context_block(raw_context: str) -> str:
     )
 
 
+def _forget_inflight(registry: dict, key: tuple[str, str], token: object) -> bool:
+    """Drop one call's entry from a process-wide in-flight registry (caller holds its lock); the key goes
+    with its last entry. True when the key is now clear."""
+    inflight = registry.get(key)
+    if inflight is not None:
+        inflight.pop(token, None)
+        if not inflight:
+            registry.pop(key, None)
+    return key not in registry
+
+
 class MemoryManager:
     """Builtin provider (always first) plus at most one external provider.
 
@@ -467,11 +478,7 @@ class MemoryManager:
                 # Every call removes its own entry when it returns, so the registry never pins
                 # a finished thread and one call's return never forgets another stuck one.
                 with self._EXTERNAL_PREFETCH_LOCK:
-                    inflight = self._EXTERNAL_PREFETCH_THREADS.get(key)
-                    if inflight is not None:
-                        inflight.pop(thread, None)
-                        if not inflight:
-                            self._EXTERNAL_PREFETCH_THREADS.pop(key, None)
+                    _forget_inflight(self._EXTERNAL_PREFETCH_THREADS, key, thread)
 
         thread = spawn_context_thread(_run, name=f"memory-prefetch-{provider.name}")
         with self._EXTERNAL_PREFETCH_LOCK:
@@ -486,9 +493,7 @@ class MemoryManager:
             except RuntimeError:
                 # Never started, so its finally never runs: drop the entry or it would gate the
                 # provider forever once its deadline passes.
-                inflight.pop(thread, None)
-                if not inflight:
-                    self._EXTERNAL_PREFETCH_THREADS.pop(key, None)
+                _forget_inflight(self._EXTERNAL_PREFETCH_THREADS, key, thread)
                 raise
 
         thread.join(self._external_prefetch_timeout)
@@ -640,9 +645,7 @@ class MemoryManager:
             call()
         finally:
             with self._BACKGROUND_CALLS_LOCK:
-                calls.pop(token, None)
-                if not calls and self._BACKGROUND_CALLS.get(key) is calls:
-                    self._BACKGROUND_CALLS.pop(key, None)
+                if _forget_inflight(self._BACKGROUND_CALLS, key, token):
                     self._BACKGROUND_SKIPS.pop(key, None)
 
     def _forget_background_future(self, future: Future) -> None:
