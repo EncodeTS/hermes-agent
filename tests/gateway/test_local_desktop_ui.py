@@ -51,7 +51,6 @@ def window(monkeypatch):
     monkeypatch.setattr(local_desktop_ui, "_process_routes", {})
     monkeypatch.setattr(local_desktop_ui, "_emitter_installed", False)
     monkeypatch.setattr(local_desktop_ui, "_process_sinks_installed", False)
-    monkeypatch.setattr(local_desktop_ui, "_connection_hook_installed", False)
     from tools.connectors.operation import ConnectionOperation
     monkeypatch.setattr(ConnectionOperation, "on_change", None)
     monkeypatch.setattr(desktop_ui, "_emit", None)
@@ -62,7 +61,8 @@ def window(monkeypatch):
     stream = SimpleNamespace(
         fanout=_Fanout(requests, silent),
         publish=lambda session_id, payload, *, event_type: streamed.append((session_id, event_type, payload)))
-    authority = SimpleNamespace(sessions={"canon": SimpleNamespace(event_stream=stream)})
+    from hermes_constants import get_hermes_home
+    authority = SimpleNamespace(sessions={"canon": SimpleNamespace(event_stream=stream)}, profile_id=str(get_hermes_home()))
     turn = SimpleNamespace(
         _ctx=SimpleNamespace(session_id="phys", session_key="agent:main:local:dm:1"),
         _approval_owner=(authority, "canon", 1),
@@ -148,3 +148,25 @@ def test_the_connection_card_opens_and_updates_on_the_owning_session(window, mon
     assert (session_id, event_type) == ("canon", "connection.update")
     assert payload["owner"] == {"type": "session", "session_id": "canon"}
     assert payload["targets"][0]["state"] == "skipped"
+
+
+def test_connection_updates_reach_the_owner_in_either_install_order(window, monkeypatch):
+    """The sidecar's hook may be installed after ours; an operation of another profile with the same route is not ours."""
+    from tools.connectors import live
+    from tools.connectors.contract import Actor, TargetState
+    from tools.connectors.operation import ConnectionOperation, Target
+
+    monkeypatch.setattr(live, "_open", {})
+    local_viewer_events.wire(window.turn, window.agent)
+    sidecar = []
+    ConnectionOperation.on_change = staticmethod(lambda operation, change, snapshot: sidecar.append(operation.op_id))
+    local_viewer_events.wire(window.turn, window.agent)
+    ours = ConnectionOperation([Target("linear", "mcp", "install")], session_key="agent:main:local:dm:1")
+    live.open(ours)
+    ours.transition("linear", TargetState.skipped, Actor.user)
+    assert window.streamed[-1][1] == "connection.update" and sidecar == []
+    other = ConnectionOperation([Target("linear", "mcp", "install")], session_key="agent:main:local:dm:1")
+    other.profile_key = "another-profile"
+    count = len(window.streamed)
+    other.transition("linear", TargetState.skipped, Actor.user)
+    assert len(window.streamed) == count and sidecar == [other.op_id]

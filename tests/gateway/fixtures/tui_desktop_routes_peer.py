@@ -215,30 +215,77 @@ async def _control_refusals(authority, ws, reader, sid, marker, receipt):
 
 
 async def _connection_card(authority, ws, reader, sid, marker, receipt):
-    """RT-2: the manage_connections card's calls reach the session's own open operation."""
+    """RT-2: the manage_connections card's calls reach the session's own open operation, with the legacy handlers' policy and error shape."""
     from pathlib import Path
     from tests.gateway.fixtures.local_recovery_probe import rpc
+    from gateway import session_connections
     from gateway.run import _profile_runtime_scope
     from tools.connectors import live
+    from tools.connectors.contract import Actor, TargetState
+    import tools.connectors as connectors
+    from tools.connectors.gateway.errors import GatewayAuthError
     from tools.connectors.operation import ConnectionOperation, Target
 
+    created = await rpc(ws, 'session.create', request_id='routes-card', source='gui', toolsets=['connections'],
+                        cwd=str(Path(authority.profile_id) / 'session-work'))
+    sid = created['result']['session_id']
     owner = {'type': 'session', 'session_id': sid}
+    connectors.connectors_available = lambda *a, **k: True
     with _profile_runtime_scope(Path(authority.profile_id)):
         operation = ConnectionOperation([Target('linear', 'mcp', 'install')], session_key=authority.sessions[sid].route)
         live.open(operation)
+    # A resume restores the open card.
+    resumed = await rpc(ws, 'session.resume', session_id=sid)
+    assert resumed['result']['pending_connection']['op_id'] == operation.op_id, resumed
     status = await rpc(ws, 'connectors.operation.status', owner=owner, op_id=operation.op_id)
     assert status.get('result', {}).get('op_id') == operation.op_id, status
     assert (await rpc(ws, 'connectors.operation.wake', owner=owner, op_id=operation.op_id)).get('result') == {'status': 'ok'}
+
+    # Try again on a failed target re-runs it under the session's own context and returns the operation.
+    operation.transition('linear', TargetState.failed, Actor.backend_watcher)
+    seen = {}
+
+    def rerun(op, names):
+        from gateway.session_context import get_session_env
+        seen.update(names=names, key=get_session_env('HERMES_SESSION_KEY'), platform=get_session_env('HERMES_SESSION_PLATFORM'))
+        op.transition('linear', TargetState.initiated, Actor.user)
+
+    session_connections._reissue = rerun
+    retried = await rpc(ws, 'connectors.connect', owner=owner, connectors=['linear'], reconnect=True)
+    assert retried.get('result', {}).get('targets', [{}])[0].get('state') == 'initiated', retried
+    assert seen == {'names': ['linear'], 'key': authority.sessions[sid].route, 'platform': 'local'}, seen
+
+    def auth_failure(op, names):
+        raise GatewayAuthError('expired', code='invalid_token', status=401)
+
+    session_connections._reissue = auth_failure
+    refused = await rpc(ws, 'connectors.connect', owner=owner, connectors=['linear'], reconnect=True)
+    assert refused['error']['code'] == 4032 and refused['error']['data']['reason'] == 'NEEDS_NOUS_AUTH', refused
+
+    def broken(op, names):
+        raise OSError('transport down')
+
+    session_connections._reissue = broken
+    failed = await rpc(ws, 'connectors.connect', owner=owner, connectors=['linear'], reconnect=True)
+    assert failed['error']['code'] == 5034 and failed['error']['data']['reason'] == 'CONNECTOR_REQUEST_FAILED', failed
+    connectors.connectors_available = lambda *a, **k: False
+    gated = await rpc(ws, 'connectors.connect', owner=owner, connectors=['linear'], reconnect=True)
+    assert gated['error']['code'] == 4031 and gated['error']['data']['reason'] == 'CONNECTORS_UNAVAILABLE', gated
+
     answered = await rpc(ws, 'connection.respond', owner=owner, op_id=operation.op_id,
                          result={'targets': [{'name': 'linear', 'status': 'skipped'}]})
     assert answered.get('result') == {'status': 'ok', 'settled': True}, answered
     assert operation.settled and operation.target('linear').state.value == 'skipped'
-    retried = await rpc(ws, 'connectors.connect', owner=owner, connectors=['linear'], reconnect=True)
-    assert _error(retried) == 'unknown_operation', retried
+    closed = await rpc(ws, 'connectors.connect', owner=owner, connectors=['linear'], reconnect=True)
+    assert closed['error']['code'] == 4004 and closed['error']['data']['reason'] == 'UNKNOWN_OPERATION', closed
+    assert (await rpc(ws, 'session.resume', session_id=sid))['result'].get('pending_connection') is None
     missing = await rpc(ws, 'connection.respond', owner=owner, op_id='no-such-op', result={'targets': []})
-    assert _error(missing) == 'unknown_operation', missing
-    denied = await _call(reader, 'connection.respond', owner=owner, op_id='no-such-op', result={'targets': []})
-    assert _error(denied) == 'permission_denied', denied
+    assert missing['error']['code'] == 4004, missing
+    # A read-only caller is refused before the session id is looked up, so it cannot probe for sessions.
+    for target in (sid, 'no-such-session'):
+        denied = await _call(reader, 'connection.respond', owner={'type': 'session', 'session_id': target},
+                             op_id='no-such-op', result={'targets': []})
+        assert _error(denied) == 'permission_denied', denied
     receipt['card'] = True
 
 
