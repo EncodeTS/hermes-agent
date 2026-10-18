@@ -425,6 +425,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         # path). Inline handlers return the response dict, written here from the loop.
         try:
             resp = await _dispatch_request(authority_connection, req, req_method, transport)
+        # health: allow BLE001 -- dispatch boundary: logs the traceback (_log.exception) and answers -32603
         except Exception:
             dispatch_crashes += 1
             _log.exception("ws dispatch crash peer=%s id=%s method=%s", peer, req_id, req_method)
@@ -562,8 +563,8 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
             failure = None if dispatcher.cancelled() else dispatcher.exception()
             if failure is not None and not isinstance(failure, _SendFailed):
                 _log.error("ws dispatcher failed peer=%s", peer, exc_info=failure)
-        if concurrent_reads:
-            await asyncio.gather(*concurrent_reads, return_exceptions=True)
+        # Concurrent reads finish before the authority closes (gathering none is a no-op).
+        await asyncio.gather(*concurrent_reads, return_exceptions=True)
         if authority_connection is not None:
             # After the dispatcher drained: an in-flight authority call must not see its connection closed.
             await authority_connection.close()
