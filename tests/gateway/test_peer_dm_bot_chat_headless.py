@@ -125,18 +125,114 @@ async def test_concurrent_peer_creates_mint_one_local_bot_chat(headless):
     assert headless.authority.db.get_session_by_title('Bot Chat')['id'] == rows[0][0]
 
 
+def _api_bot_chat(db, sid='api_1_stale', source='api_server', hidden=True):
+    """A canonical Bot Chat an older gateway minted through the plain API create (#140769): an
+    ``api_`` row, no ``chat_id``, that no native client can ever adopt."""
+    db.create_session(sid, source)
+    db.set_session_title(sid, 'Bot Chat')
+    db.append_message(sid, 'user', 'old history')
+    if hidden:
+        db._execute_write(lambda conn: conn.execute('UPDATE sessions SET hidden=1 WHERE id=?', (sid,)))
+    return sid
+
+
+def _assert_displaced(db, old, new):
+    """The API row keeps its id and history under a visible name; the title is the local chat's."""
+    row = db.get_session(old)
+    assert row['title'] == f'Bot Chat (API {old})' and not row['hidden'], row
+    assert [m['content'] for m in db.get_messages(old)] == ['old history']
+    titled = db._read_all("SELECT id FROM sessions WHERE title = 'Bot Chat'")
+    assert [r[0] for r in titled] == [new] and str(db.get_session(new)['chat_id']).startswith('local-')
+
+
+@pytest.mark.parametrize('source', ['api_server', 'bot_peer_dm'])
 @pytest.mark.asyncio
-async def test_peer_created_api_bot_chat_is_refused_by_name(headless):
-    # A row an older gateway minted through the plain API create: no FIFO can own it.
+async def test_peer_dm_into_an_api_created_bot_chat_lands_in_a_local_bot_chat(headless, source):
+    # #140769 / MSG-21: main refused every DM with ``bot_chat_not_local`` ("rename or delete it
+    # there"), and neither is possible: the canonical title cannot be renamed and the API has no
+    # rename route. The owner now moves the API row aside and mints the local Bot Chat.
     db = headless.authority.db
-    db.create_session('api_1_stale', 'bot_peer_dm')
-    db.set_session_title('api_1_stale', 'Bot Chat')
-    resp = await headless.cli.post("/api/sessions/api_1_stale/chat", json={"message": "ping", "author": AUTHOR})
+    old = _api_bot_chat(db, source=source)
+    resp = await headless.cli.post(f"/api/sessions/{old}/chat", json={"message": 'one', "author": AUTHOR})
     body = await resp.json()
-    assert resp.status == 502, body
-    assert body['error']['code'] == 'bot_chat_not_local', body
-    assert 'not_found' not in body['error']['message']
-    assert headless.executed == [] and _api_admissions(headless.authority) == []
+    assert resp.status == 200, body
+    assert body['message']['content'] == 'pong'
+    new = db.get_session_by_title('Bot Chat')['id']
+    assert new != old and db.get_session(new)['user_id'] == 'api-peer'
+    _assert_displaced(db, old, new)
+    # ``hermes peer dm`` resolves the Bot Chat by title on every call: the next DM names the new id.
+    resp = await headless.cli.post(f"/api/sessions/{new}/chat", json={"message": 'two', "author": AUTHOR})
+    assert resp.status == 200 and (await resp.json())['message']['content'] == 'pong'
+    assert [(sid, text) for sid, _, text in headless.executed] == [(new, 'one'), (new, 'two')]
+    assert _api_admissions(headless.authority) == [], 'the API row was never bound as an API conversation'
+    # Each retry reuses the one local chat: no second Bot Chat, no new api_ row.
+    assert len(_sessions(headless.authority)) == 2
+
+
+@pytest.mark.asyncio
+async def test_peer_create_if_missing_after_the_api_row_moved_finds_the_local_chat(headless):
+    db = headless.authority.db
+    old = _api_bot_chat(db)
+    resp = await headless.cli.post(f"/api/sessions/{old}/chat", json={"message": "one", "author": AUTHOR})
+    assert resp.status == 200, await resp.text()
+    # ``hermes peer dm``'s next create-if-missing collides on the local chat's title, as for any
+    # existing Bot Chat; it never mints another row.
+    again = await headless.cli.post("/api/sessions", json={"title": "Bot Chat", "source": "bot_peer_dm"})
+    assert again.status == 400 and (await again.json())['error']['code'] == 'invalid_title'
+    assert len(_sessions(headless.authority)) == 2
+
+
+@pytest.mark.asyncio
+async def test_local_bot_relay_delivery_moves_an_api_bot_chat_aside(headless):
+    # MSG-21 on the local door: ``bot_relay.deliver`` / a cron delivery found the API row by title
+    # and failed adoption with ``not_found``, permanently.
+    from pathlib import Path
+    from gateway.session_authorities import served_profile_name
+    from gateway.session_bot import deliver
+    from tests.waiting import async_wait_until
+    db = headless.authority.db
+    old = _api_bot_chat(db)
+    profile = served_profile_name(Path(db.db_path).parent.resolve())
+    record = await deliver(_local_owner(headless.authority),
+                           dict(id='e' * 32, profile=profile, message='relayed', author=AUTHOR))
+    new = record['session_id']
+    _assert_displaced(db, old, new)
+    await async_wait_until(lambda: headless.executed, timeout=10, interval=.05)
+    assert [(sid, text) for sid, _, text in headless.executed] == [(new, 'relayed')]
+
+
+@pytest.mark.asyncio
+async def test_a_submit_only_delivery_never_moves_the_api_bot_chat(headless):
+    # Owner recovery and other submit-only principals cannot create the replacement, so the title
+    # stays where it is (still ``not_found``): moving it would leave the profile with no Bot Chat.
+    from pathlib import Path
+    from gateway.session_authorities import served_profile_name
+    from gateway.session_bot import deliver
+    from gateway.session_contract import Principal
+    from hermes_state_runtime import RuntimeStoreError
+    db = headless.authority.db
+    old = _api_bot_chat(db)
+    actor = Principal('uid:1000', headless.authority.profile_id,
+                      frozenset({'session:submit', 'session:read'}), 'bot-owner-recovery')
+    profile = served_profile_name(Path(db.db_path).parent.resolve())
+    with pytest.raises(RuntimeStoreError) as exc:
+        await deliver(SimpleNamespace(authority=headless.authority, actor=actor),
+                      dict(id='f' * 32, profile=profile, message='relayed'))
+    assert exc.value.reason == 'not_found'
+    assert db.get_session_by_title('Bot Chat')['id'] == old and len(_sessions(headless.authority)) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_adoptable_legacy_bot_chat_is_not_moved_aside(headless):
+    # A pre-upgrade CLI Bot Chat is real local history its owner adopts on first open; the peer is
+    # told so by name, and its title and history stay where they are.
+    db = headless.authority.db
+    db.create_session('legacy_cli', 'cli')
+    db.set_session_title('legacy_cli', 'Bot Chat')
+    resp = await headless.cli.post("/api/sessions/legacy_cli/chat", json={"message": "ping", "author": AUTHOR})
+    body = await resp.json()
+    assert resp.status == 502 and body['error']['code'] == 'bot_chat_unbound', body
+    assert db.get_session_by_title('Bot Chat')['id'] == 'legacy_cli' and len(_sessions(headless.authority)) == 1
 
 
 async def _peer_minted(headless):
