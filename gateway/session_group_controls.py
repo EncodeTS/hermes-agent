@@ -447,6 +447,6 @@ def _profiles(authority, actor, home, params, siblings=()):
     from hermes_cli.install_identity import get_install_id
     try:
         install_id = get_install_id() or ''
-    except Exception:
+    except OSError:
         install_id = ''
     return {'profiles': profiles, 'bot_mode_protocol': True, 'install_id': install_id}
