@@ -110,6 +110,28 @@ def owned_receipt(authority, sid):
     return receipt, source, route, _checked_entry(authority, receipt, source, route)
 
 
+def _stray_route_target(authority, receipt, session_id):
+    """*session_id* is a replacement the SessionStore's stale-route self-heal minted on this local
+    route before #140642: outside the receipt's lineage, never admitted, no transcript. The receipt
+    is the route's truth, so restoring it drops that entry instead of refusing the conversation
+    forever (``admission_conflict`` on every resume). Anything with history or ledger rows still
+    refuses: it is not provably a stray."""
+    if not session_id or session_id in receipt.get('lineage', [receipt['session_id']]):
+        return False
+    with authority.db._read_ctx() as conn:
+        busy = conn.execute(
+            'SELECT 1 FROM messages WHERE session_id=? UNION ALL SELECT 1 FROM session_admissions '
+            'WHERE target_session_id=? UNION ALL SELECT 1 FROM worker_executions WHERE session_id=? '
+            'UNION ALL SELECT 1 FROM sessions WHERE parent_session_id=? LIMIT 1',
+            (session_id, session_id, session_id, session_id)).fetchone()
+    if busy is not None:
+        return False
+    logging.getLogger(__name__).warning(
+        'Local route for %s named an empty replacement %s outside its lineage; restoring the receipt target',
+        receipt['session_id'], session_id)
+    return True
+
+
 def restore_local_session(authority, sid):
     from gateway.session_authority import LiveSession
     from gateway.session_local import LocalSessionAdapter
@@ -147,7 +169,9 @@ def restore_local_session(authority, sid):
             store._ensure_loaded_locked()
             current = store._entries.get(route)
             if current is not None and current.session_id != target:
-                raise RuntimeStoreError('admission_conflict')
+                if not _stray_route_target(authority, receipt, current.session_id):
+                    raise RuntimeStoreError('admission_conflict')
+                current = None
             # The receipt is the creation copy; a persisted entry for the same target keeps the
             # route's explicit ``/yolo`` toggle (an OFF over a ``--yolo`` launch must survive a
             # cold restore). An untoggled entry stays None and keeps following the launch policy.
@@ -165,7 +189,8 @@ def restore_local_session(authority, sid):
     else:
         with store._lock:
             current = store._entry_locked(route)
-            if current is None or current.session_id not in receipt.get('lineage', [sid]):
+            if current is None or (current.session_id not in receipt.get('lineage', [sid])
+                                   and not _stray_route_target(authority, receipt, current.session_id)):
                 raise RuntimeStoreError('admission_conflict')
             current.session_id = target
     return SessionRef(authority.profile_id, sid)
