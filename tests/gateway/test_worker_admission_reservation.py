@@ -139,3 +139,40 @@ async def test_input_queued_behind_a_live_worker_is_released_then_runs_when_it_f
         process.stdin.close()
         process.wait(timeout=5)
         db.close()
+
+
+@pytest.mark.parametrize('drift', [5.0, -5.0])
+def test_reservation_survives_a_clock_step_under_emulated_macos_psutil(tmp_path, monkeypatch, drift):
+    """#140580, on every platform: emulate psutil's macOS ``create_time()``. The kernel records an
+    epoch start; psutil adds ``abs(INIT_BOOT_TIME - boot_time())`` (``_psosx.adjust_proc_create_time``)
+    with a reference frozen at import. A long-lived owner's reference is stale after a clock step
+    either way, a fresh worker's is not, so the exact match refused every managed worker.
+    Monkeypatched: ``psutil.MACOS`` and the platform ``create_time``; the reservation is real."""
+    from gateway.session_worker_reservation import reserve_admission_worker
+    db = SessionDB(tmp_path / 'state.db')
+    process = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        frame = hello(process)  # what the freshly started worker reports (its reference is current)
+        kernel = psutil._psplatform.Process.create_time
+
+        def owner_view(self, monotonic=False, **kwargs):  # the owner's stale reference
+            start = kernel(self, **kwargs)  # an epoch start, as macOS kinfo_proc records it
+            return start if monotonic else start + abs(drift)
+
+        monkeypatch.setattr(psutil, 'MACOS', True)
+        monkeypatch.setattr(psutil._psplatform.Process, 'create_time', owner_view)
+        db.create_session('owned', 'cli')
+        epoch = begin_runtime_epoch(db, instance_id='owner')
+        authority = SimpleNamespace(db=db, epoch=epoch, profile_id=str(tmp_path), _require_admission_open=lambda: None)
+        admitted = admit_session_input(db, epoch=epoch, principal_id='human', session_id='owned', request_id='input', payload={})
+        claim_session_input(db, epoch=epoch, session_id='owned')
+        kwargs = dict(admission_id=admitted['admission_id'], process=process, principal_id='human')
+        with pytest.raises(Exception, match='permission_denied'):  # a forged birth still fails
+            reserve_admission_worker(authority, hello=frame | {'birth': frame['birth'] + 1}, **kwargs)
+        scope = reserve_admission_worker(authority, hello=frame, **kwargs)
+        assert scope['pid'] == process.pid and scope['birth'] == frame['birth']
+    finally:
+        process.stdin.close()
+        process.wait(timeout=5)
+        db.close()
