@@ -58,6 +58,9 @@ class LiveSession:
     # (a contended SQLite writer must not stall loop-side lock takers); readers holding that lock
     # still see the claim as started, so no snapshot shows a terminal row without its completion.
     settling: dict = field(default_factory=dict)
+    # ``(revision key, payload)`` of the last ``session.context_breakdown``: Desktop re-polls it on
+    # every idle mount and reconnect, and a rebuild walks the whole stored transcript (#140667).
+    context_breakdown: tuple | None = None
     # A viewer attached while a guarded deferred pick awaits consent: the next boundary asks again.
     reask_pick: bool = False
     # A historic messaging row mounted for reading after its lane moved on (``/new``): ``route`` is

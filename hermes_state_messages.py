@@ -1532,6 +1532,16 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
             repair_alternation=repair_alternation, include_row_ids=include_row_ids,
             include_summary_markers=repair_alternation)
 
+    def conversation_revision(self, session_id: str, include_ancestors: bool = False) -> tuple:
+        """A cheap fingerprint of what ``get_messages_as_conversation`` (live rows) would load: the
+        lineage ids plus the active rows' count and highest id. Any append, rewind, undo or compaction
+        moves it, so a payload derived from the transcript can be reused while it holds."""
+        ids = self._resume_lineage_ids(session_id) if include_ancestors else [session_id]
+        row = self._read_one(
+            f"SELECT COUNT(*), COALESCE(MAX(id), 0) FROM messages WHERE session_id IN ({_placeholders(ids)})"
+            " AND active = 1", tuple(ids))
+        return (tuple(ids), int(row[0]), int(row[1]))
+
     def _dedupe_replayed_user(self, messages, msg, exact_user_clones) -> tuple[bool, Any]:
         """Ancestor-lineage dedupe of one decoded user *msg* -> ``(skip, exact_clone_key)``. Rotation
         column-clones the concurrent tail into the child, so copies need not be adjacent: the exact
