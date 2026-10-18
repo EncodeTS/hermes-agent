@@ -21,6 +21,8 @@ import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import hermes_constants_scratch_stuck as stuck
+
 logger = logging.getLogger(__name__)
 
 # How long a TERMed process gets before KILL; browsers exit well within this.
@@ -362,6 +364,10 @@ def _prune_idle_entries(
     root: Path, max_idle_hours: float, skip_names: frozenset[str], audit: logging.Logger,
 ) -> int:
     cutoff = time.time() - max_idle_hours * 3600
+    # Entries already known to hold files this user cannot delete are skipped before any
+    # walk, until their fingerprint changes (hermes_constants_scratch_stuck).
+    stuck_state, stuck_names = stuck.load_skips(root)
+    skip_names = skip_names | stuck_names | {stuck.STUCK_STATE_NAME}
     try:
         entries = [e for e in root.iterdir() if e.name not in skip_names]
     except OSError:
@@ -421,9 +427,10 @@ def _prune_idle_entries(
                     os.fspath(entry),
                 )
             continue
+        denied = False
         try:
             if entry.is_dir() and not entry.is_symlink():
-                shutil.rmtree(entry, ignore_errors=True)
+                denied = stuck.rmtree_collecting_permission_errors(entry)
             else:
                 entry.unlink()
         except OSError as exc:
@@ -436,7 +443,10 @@ def _prune_idle_entries(
         # above refuses to invent (P2 on #134173).
         try:
             os.lstat(entry)
-            audit.info("scratch prune: could not fully remove %r", os.fspath(entry))
+            if denied and stuck.tracking_supported():
+                stuck.record(root, stuck_state, entry, audit)
+            else:
+                audit.info("scratch prune: could not fully remove %r", os.fspath(entry))
             continue
         except FileNotFoundError:
             pass
