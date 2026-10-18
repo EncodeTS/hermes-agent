@@ -367,6 +367,25 @@ export interface SelectConnectionOptions {
   restore?: boolean
 }
 
+/** The silent boot restore, by its caller's word, or (first pass, before any
+ *  source is published) by the old null-id inference. */
+function isBootRestore(options: SelectConnectionOptions): boolean {
+  return options.restore === true || (pendingTarget === null && $activeConnectionId.get() === null)
+}
+
+/** The requested pair is already live, so nothing was switched: `selectConnection`
+ *  only reaches this with `switching` true because "All profiles" is on. A user
+ *  pick collapses the browse view; a boot restore leaves it alone, since
+ *  collapsing it here dropped the user back to a single profile at every launch. */
+async function settleLivePair(connectionId: string, targetProfile: string, restoreOnBoot: boolean): Promise<void> {
+  if (!restoreOnBoot) {
+    $showAllProfiles.set(false)
+  }
+
+  rehomeNewChatDraft(targetProfile)
+  await rememberConnection(connectionId)
+}
+
 export async function selectConnection(connectionId: string, options: SelectConnectionOptions = {}): Promise<void> {
   const registry = $connectionsRegistry.get()
   const targetConnection = registry?.connections.find(connection => connection.id === connectionId)
@@ -381,7 +400,7 @@ export async function selectConnection(connectionId: string, options: SelectConn
   // browse-mode preference alone so it survives restart (#93197). The caller
   // that knows it is restoring says so; the null-id inference stays as the
   // fallback for the first pass, when no source has been published yet.
-  const restoreOnBoot = options.restore === true || (pendingTarget === null && $activeConnectionId.get() === null)
+  const restoreOnBoot = isBootRestore(options)
 
   const currentConnectionId = $activeConnectionId.get()
   const currentProfile = normalizeProfileKey($activeGatewayProfile.get())
@@ -427,15 +446,7 @@ export async function selectConnection(connectionId: string, options: SelectConn
   }
 
   if (pendingTarget === null && currentConnectionId === connectionId && currentProfile === targetProfile) {
-    // The pair is already live, so nothing was switched — this branch is only
-    // reached with `switching` true because "All profiles" is on. Collapsing the
-    // browse view here is what dropped the user back to a single profile.
-    if (!restoreOnBoot) {
-      $showAllProfiles.set(false)
-    }
-
-    rehomeNewChatDraft(targetProfile)
-    await rememberConnection(connectionId)
+    await settleLivePair(connectionId, targetProfile, restoreOnBoot)
 
     return
   }
