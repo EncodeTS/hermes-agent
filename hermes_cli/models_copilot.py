@@ -28,7 +28,7 @@ def copilot_model_api_mode(
 
     if catalog is None and api_key:
         catalog = models.fetch_github_model_catalog(api_key=api_key)
-    normalized = models.normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
+    normalized = models.normalize_copilot_model_id(model_id, catalog=catalog or [])
     item = next((item for item in (catalog or []) if item.get("id") == normalized), {})
     endpoints = item.get("supported_endpoints")
     supported = {mode for endpoint, mode in _HTTP_API_MODES.items()
