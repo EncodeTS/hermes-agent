@@ -689,14 +689,35 @@ class _ProfileRoutingFileHandler(logging.Handler):
 
     def _handler_for_home(self, home: Path) -> _ManagedRotatingFileHandler:
         with self._profile_handlers_lock:
-            if home not in self._profile_handlers:
-                handler = _new_file_handler(
-                    home / "logs" / self._filename, level=self.level, max_bytes=self._max_bytes,
-                    backup_count=self._backup_count, formatter=self.formatter,
-                )
-                handler._skip_write_when_dir_missing = home != self._default_home
-                self._profile_handlers[home] = handler
-            return self._profile_handlers[home]
+            handler = self._profile_handlers.get(home)
+        if handler is not None:
+            return handler
+        # Built with no router lock held: ``Handler.__init__`` takes ``logging._lock``, and
+        # ``logging.shutdown`` (uvicorn's ``dictConfig``) holds that lock while it acquires each
+        # handler's lock and closes it (``close`` takes ``_profile_handlers_lock``). Holding
+        # either router lock here deadlocked the QueueListener against ``dictConfig`` (T23).
+        built = _new_file_handler(
+            home / "logs" / self._filename, level=self.level, max_bytes=self._max_bytes,
+            backup_count=self._backup_count, formatter=self.formatter,
+        )
+        built._skip_write_when_dir_missing = home != self._default_home
+        with self._profile_handlers_lock:
+            handler = self._profile_handlers.setdefault(home, built)
+        if handler is not built:  # another thread opened it first
+            _quietly(built.close)
+        return handler
+
+    def handle(self, record: logging.LogRecord):
+        """``Handler.handle`` without this router's own I/O lock: each per-home handler takes its
+        own lock to write, and routing state has ``_profile_handlers_lock``. Holding ``self.lock``
+        across ``emit`` (which can open a handler, taking ``logging._lock``) inverted the order
+        ``logging.shutdown`` uses (module lock, then handler lock) (T23)."""
+        rv = self.filter(record)
+        if isinstance(rv, logging.LogRecord):
+            record = rv
+        if rv:
+            self.emit(record)
+        return rv
 
     def emit(self, record: logging.LogRecord) -> None:
         try:

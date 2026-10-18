@@ -1033,3 +1033,42 @@ class TestRolloverPreservesLogOwnership:
         monkeypatch.setattr(os, "chown", _refuse)
         self._rolled_handler(log_path)
         assert log_path.exists()
+
+
+def test_profile_router_never_holds_its_lock_while_taking_the_logging_module_lock(hermes_home, monkeypatch):
+    """T23: uvicorn's ``dictConfig`` holds ``logging._lock`` and, in ``logging.shutdown``, waits on
+    every handler's lock. The QueueListener thread routing a record to a not-yet-opened profile
+    home built that home's file handler (``Handler.__init__`` takes ``logging._lock``) while
+    ``Handler.handle`` held the router's lock: a lock-order deadlock that hung
+    ``test_runtime_listener_supervision`` on CI. The router must take the module lock with no
+    lock of its own held."""
+    profile = hermes_home / "profiles" / "t23"
+    (profile / "logs").mkdir(parents=True)
+    hermes_home.joinpath("logs").mkdir(exist_ok=True)
+    existing = RotatingFileHandler(str(hermes_home / "logs" / "agent.log"), encoding="utf-8")
+    router = hermes_logging._ProfileRoutingFileHandler(existing, [profile])
+    existing.close()
+    building, real_new = threading.Event(), hermes_logging._new_file_handler
+
+    def new_file_handler(*args, **kwargs):
+        building.set()
+        return real_new(*args, **kwargs)
+
+    monkeypatch.setattr(hermes_logging, "_new_file_handler", new_file_handler)
+    record = logging.LogRecord("t23", logging.ERROR, __file__, 1, "routed", None, None)
+    record.hermes_home = str(profile)
+    listener = threading.Thread(target=router.handle, args=(record,), daemon=True)
+    with logging._lock:  # dictConfig's configure() holds this across _clearExistingHandlers()
+        listener.start()
+        assert building.wait(5)
+        # logging.shutdown -> h.acquire(): must not wait on a listener blocked on our module lock.
+        acquired = router.lock.acquire(timeout=2)
+        if acquired:
+            router.lock.release()
+    listener.join(5)
+    try:
+        assert acquired, "router held its lock while waiting on logging._lock (dictConfig deadlock)"
+        assert not listener.is_alive()
+        assert "routed" in (profile / "logs" / "agent.log").read_text(encoding="utf-8")
+    finally:
+        router.close()
