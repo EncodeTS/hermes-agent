@@ -80,3 +80,14 @@ def test_the_tree_probe_reads_the_checkout_on_disk(tmp_path):
     git("checkout", "-q", "--detach", "old")
     assert rde.tree_predates_runtime(tmp_path) is True
     assert rde.tree_predates_runtime(tmp_path / "missing") is False  # nothing readable proves nothing
+
+
+def test_the_downgrade_exit_code_reaches_the_process_exit():
+    """The bootstrap's exit verdict raises the runner's code, so launchd (SuccessfulExit=false) sees 75."""
+    import pytest
+    from gateway.run_shutdown import _resolve_gateway_exit_verdict
+    runner = _watch([_SKEW, _SKEW])
+    runner.should_exit_with_failure, runner._restart_requested, runner._restart_via_service = False, False, False
+    with pytest.raises(SystemExit) as exc:
+        _resolve_gateway_exit_verdict(runner, signal_initiated_shutdown=False)
+    assert exc.value.code == GATEWAY_SERVICE_RESTART_EXIT_CODE

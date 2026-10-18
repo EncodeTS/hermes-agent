@@ -7,8 +7,11 @@ profile. Nothing on the older side knows how to stop it. So the gateway watches 
 revision ``gateway.code_skew`` records. Once the checkout has provably moved (two consecutive
 reads, never while an update holds the tree) to code whose state-store modules lack the runtime
 ledger, it logs why and stops with the normal drain (a hard exit if that stop fails on the older
-tree). It never asks for a restart, so a service manager that relaunches it starts the older
-release's own gateway. Every uncertain read keeps it up.
+tree). The stop is a plain stop, never a restart of this process, but it exits with the
+service-restart code (75): systemd relaunches on any exit, while the launchd plist's
+``KeepAlive.SuccessfulExit=false`` parks exit 0 and would leave the gateway down for good. Either
+supervisor then starts the older release's own gateway from the tree on disk. Every uncertain read
+keeps it up.
 """
 
 from __future__ import annotations
@@ -43,8 +46,8 @@ def downgrade_reason(skew, *, update_in_progress: bool, predates: Callable[[], b
     if not skew or update_in_progress or not predates():
         return None
     return ("This gateway loaded {}, but its checkout is now at {}, a release that predates the gateway "
-            "runtime. Downgrading is unsupported; stopping (no restart) so the older release can run its "
-            "own gateway.".format(*tuple(skew)))
+            "runtime. Downgrading is unsupported; stopping so the service manager starts the older "
+            "release's own gateway.".format(*tuple(skew)))
 
 
 async def _stop_or_exit(runner, *, hard_exit: Callable[[int], None] = os._exit) -> None:
