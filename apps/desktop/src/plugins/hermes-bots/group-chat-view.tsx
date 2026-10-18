@@ -42,7 +42,7 @@ import { avatarColor, botAppearance, BotFace } from './avatar'
 import { isBackfilledFacePng } from './avatar-image'
 import { groupCreationSource, groupExecutionMode } from './canonical-group-capabilities'
 import type { GroupExecutionMode } from './canonical-group-capabilities'
-import { $canonicalGroupBindings, registerCanonicalGroup } from './canonical-group-registry'
+import { $canonicalGroupBindings, parseCanonicalGroupKey, registerCanonicalGroup, resolveCanonicalGroup } from './canonical-group-registry'
 import { CanonicalGroupWorkspace } from './canonical-group-workspace'
 import { canonicalGroupRequest, createCanonicalGroup } from './canonical-groups'
 import {
@@ -593,6 +593,27 @@ function GroupExecutionGate(props: GroupChatWorkspaceProps) {
   const mode = capability?.source === source ? capability.mode : 'checking'
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  // #140805: 'found' means the binding was adopted and the workspace re-renders
+  // onto it; only 'missing' (the authority answered, no such room) may offer creation.
+  const [lookup, setLookup] = useState<{ source: string; status: 'pending' | 'missing' | 'failed' } | null>(null)
+  const [lookupAttempt, setLookupAttempt] = useState(0)
+  const lookupStatus = lookup?.source === source ? lookup.status : 'pending'
+  useEffect(() => {
+    if (mode !== 'canonical') {return}
+    let cancelled = false
+    setLookup({ source, status: 'pending' })
+    setError('')
+    void resolveCanonicalGroup({ connectionId: connectionId ?? '', profile }, props.group)
+      .then(binding => { if (!cancelled && !binding) {setLookup({ source, status: 'missing' })} })
+      .catch(e => {
+        if (!cancelled) {
+          setLookup({ source, status: 'failed' })
+          setError(e instanceof Error ? e.message : String(e))
+        }
+      })
+
+    return () => { cancelled = true }
+  }, [mode, source, props.group, lookupAttempt, connectionId, profile])
   useEffect(() => {
     let cancelled = false
     setCapability(null)
@@ -618,16 +639,28 @@ function GroupExecutionGate(props: GroupChatWorkspaceProps) {
 
   if (mode === 'legacy') {return <LegacyGroupChatWorkspace {...props} />}
 
+  // A `canonical:` key names an existing room; it never seeds a new one.
+  const canCreate = mode === 'canonical' && lookupStatus === 'missing' && parseCanonicalGroupKey(props.group) === null
+
+  const message = mode !== 'canonical'
+    ? mode === 'unavailable' ? b.canonical.driverUnavailable : 'Checking group driver…'
+    : lookupStatus === 'pending' ? 'Opening gateway group…'
+      : lookupStatus === 'failed' ? 'Could not look up this group on the gateway. Try again.'
+        : canCreate ? 'This is a legacy Desktop room. Start a gateway-owned group with these members; the old history stays here and is not replayed.'
+          : 'This gateway group no longer exists.'
+
   return <div className="grid gap-3 p-3">
     <h2>{props.group}</h2>
-    <p>{mode === 'canonical' ? 'This is a legacy Desktop room. Start a gateway-owned group with these members; the old history stays here and is not replayed.' : mode === 'unavailable' ? b.canonical.driverUnavailable : 'Checking group driver…'}</p>
+    <p>{message}</p>
     {error && <p role="alert">{error}</p>}
-    <Button disabled={mode !== 'canonical' || busy} onClick={() => {
+    {mode === 'canonical' && lookupStatus !== 'pending' && !canCreate &&
+      <Button onClick={() => setLookupAttempt(value => value + 1)} variant="secondary">Retry</Button>}
+    <Button disabled={!canCreate || busy} onClick={() => {
       const route = { connectionId: connectionId ?? '', profile }
 
       const sourceCurrent = groupCreationSource(route, activationEpoch)
 
-      if (mode !== 'canonical' || !sourceCurrent()) {
+      if (!canCreate || !sourceCurrent()) {
         setError(b.canonical.driverUnavailable)
 
         return

@@ -14,6 +14,43 @@ export function registerCanonicalGroup(route: CanonicalGroupRoute, room: Canonic
   return key
 }
 
+/** The route a `canonical:<connection>:<profile>:<room_id>` key was minted on, or null for a name. */
+export function parseCanonicalGroupKey(key: string): (CanonicalGroupRoute & { roomId: string }) | null {
+  const match = /^canonical:([^:]*):([^:]*):(.+)$/.exec(key)
+
+  if (!match) {return null}
+
+  try {
+    return { connectionId: decodeURIComponent(match[1]), profile: decodeURIComponent(match[2]), roomId: match[3] }
+  } catch {
+    return null
+  }
+}
+
+/** #140805: bindings live in memory, so after a restart a group opened by name
+ *  (roster row) or by a restored `canonical:` tab key misses. Resolve it against
+ *  the gateway's `groups.list` and alias the existing room under the key the
+ *  caller used. Returns null only when the authority answered and holds no such
+ *  room; a failed lookup THROWS, so the caller fails closed (retry, never mint).
+ *  Same-name forks resolve to the most recently updated room (list order). */
+export async function resolveCanonicalGroup(
+  route: CanonicalGroupRoute,
+  group: string
+): Promise<CanonicalGroupBinding | null> {
+  const parsed = parseCanonicalGroupKey(group)
+  const authority = parsed ? { connectionId: parsed.connectionId, profile: parsed.profile } : route
+  const { rooms } = await discoverCanonicalGroups(authority)
+  const room = parsed ? rooms.find(r => r.room_id === parsed.roomId) : rooms.find(r => r.name === group)
+
+  if (!room) {return null}
+
+  registerCanonicalGroup(authority, room)
+  const binding = { ...authority, roomId: room.room_id, roomName: room.name }
+  $canonicalGroupBindings.set({ ...$canonicalGroupBindings.get(), [group]: binding })
+
+  return binding
+}
+
 export function CanonicalGroupList({ onOpen }: { onOpen: (key: string) => void }) {
   const labels = useCanonicalGroupLabels()
   const connectionId = useValue(host.state.connectionId)
