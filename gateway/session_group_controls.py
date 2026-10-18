@@ -432,4 +432,21 @@ def _profiles(authority, actor, home, params, siblings=()):
     if service is not None:
         for configured, target in service.profile_homes().items():
             discovered(configured, target)
-    return {'profiles': profiles, 'bot_mode_protocol': True}
+    # Every other profile under this root, as the pre-authority ``profiles.list`` named them
+    # (RT-38): a host running one gateway per profile serves no siblings, and Desktop drops every
+    # union agent the active source leaves out, so a default-only answer hid the other bots.
+    # Metadata only, like any discovery above.
+    from hermes_cli.profiles import _get_default_hermes_home, _iter_named_profile_dirs
+    root = _get_default_hermes_home()
+    if root.is_dir():
+        discovered('default', root)
+    for target in _iter_named_profile_dirs():
+        discovered(target.name, target)
+    # ``install_id`` (same value as /api/status) lets a multi-connection client prove which
+    # machine answered; the roster trace logged ``answered=-`` without it.
+    from hermes_cli.install_identity import get_install_id
+    try:
+        install_id = get_install_id() or ''
+    except Exception:
+        install_id = ''
+    return {'profiles': profiles, 'bot_mode_protocol': True, 'install_id': install_id}
