@@ -77,7 +77,7 @@ class TicketBridge {
     this.child.on('close', () => this.dispose())
   }
 
-  request(endpoint: TicketEndpoint, purpose: 'interactive' | 'native-http' | 'native-profile-create'): Promise<string> {
+  request(endpoint: TicketEndpoint, purpose: 'interactive' | 'native-http' | 'native-profile-create' | 'native-profile-registry'): Promise<string> {
     clearTimeout(this.idleTimer)
 
     return new Promise((resolve, reject) => {
@@ -238,7 +238,7 @@ export function createGatewayTicketResolver(resolveBackend: () => Promise<Resolv
   let cached: Promise<{ command: string; env?: NodeJS.ProcessEnv }> | undefined
   let cachedGeneration = -1
 
-  return async (endpoint: TicketEndpoint, purpose: 'interactive' | 'native-http' | 'native-profile-create'): Promise<string> => {
+  return async (endpoint: TicketEndpoint, purpose: 'interactive' | 'native-http' | 'native-profile-create' | 'native-profile-registry'): Promise<string> => {
     const generation = bridgeGeneration
 
     if (!cached || cachedGeneration !== generation) {
@@ -264,7 +264,7 @@ export function mintGatewayTicketWithPython(
   backend: { command: string; env?: NodeJS.ProcessEnv },
   cwd: string,
   endpoint: TicketEndpoint,
-  purpose: 'interactive' | 'native-http' | 'native-profile-create'
+  purpose: 'interactive' | 'native-http' | 'native-profile-create' | 'native-profile-registry'
 ): Promise<string> {
   const env = { ...process.env, ...backend.env, HERMES_HOME: endpoint.profile_id,
     PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }

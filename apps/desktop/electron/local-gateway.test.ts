@@ -97,7 +97,13 @@ test.skipIf(process.platform === 'win32').each([0o700, 0o750, 0o701])('native HT
       ['/api/profiles?unused=1', 'post', 'native-profile-create'],
       ['/api/profiles', 'GET', 'native-http'],
       ['/api/profiles/import', 'POST', 'native-http'],
-      ['/api/config', 'POST', 'native-http']
+      ['/api/config', 'POST', 'native-http'],
+      // Rename/delete of the launch profile ride the registry grant (#140345); its SOUL stays native-http.
+      ['/api/profiles/default', 'PATCH', 'native-profile-registry'],
+      ['/api/profiles/default', 'delete', 'native-profile-registry'],
+      ['/api/profiles/default/soul', 'PUT', 'native-http'],
+      ['/api/profiles/active', 'PATCH', 'native-http'],
+      ['/api/profiles/import', 'DELETE', 'native-http']
     ]) {
       await nativeGatewayHttpHeaders(descriptor, endpoint.api_origin + route, home, method)
       expect(requests.at(-1).params).toEqual({ profile_id: home, instance_id: 'owner', purpose })

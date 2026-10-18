@@ -468,6 +468,25 @@ export async function routedTicketEndpoint(endpoint: GatewayEndpoint, urlOrProfi
   return { ...routed, profile_id: home }
 }
 
+/** Every purpose a Desktop mints a gateway ticket for (gateway/runtime_bootstrap.py). */
+export type GatewayTicketPurpose = 'interactive' | 'native-http' | 'native-profile-create' | 'native-profile-registry'
+
+/** The native grant a REST request needs. Creating a profile and renaming/deleting the one a path
+ *  names are registry operations with grants of their own; every other route is `native-http`. */
+export function nativeGrantPurpose(url: string, method = 'GET'): GatewayTicketPurpose {
+  const verb = method.toUpperCase()
+  const pathname = new URL(url).pathname.replace(/\/+$/, '')
+
+  if (verb === 'POST' && pathname === '/api/profiles') {return 'native-profile-create'}
+  const suffix = pathname.startsWith('/api/profiles/') ? pathname.slice('/api/profiles/'.length) : ''
+
+  if ((verb === 'PATCH' || verb === 'DELETE') && suffix && !suffix.includes('/') && !PROFILE_COLLECTION_ROUTES.has(suffix)) {
+    return 'native-profile-registry'
+  }
+
+  return 'native-http'
+}
+
 /** What a native grant is minted for: the URL's own profile selector or, when it names none, a
  *  JSON body's `profile`. The gateway checks both against the grant, and a session write such as
  *  `PATCH /api/sessions/<id>` names its owner in the body alone. */
@@ -483,21 +502,20 @@ export async function nativeGatewayHttpHeaders(descriptor: { gatewayEndpoint: Ga
     throw new Error('Native gateway HTTP origin mismatch')
   }
 
-  const purpose = method.toUpperCase() === 'POST' && new URL(url).pathname.replace(/\/$/, '') === '/api/profiles'
-    ? 'native-profile-create' : 'native-http'
+  const purpose = nativeGrantPurpose(url, method)
 
   return { 'X-Hermes-Gateway-Ticket': await mintLocalGatewayTicket(await routedTicketEndpoint(descriptor.gatewayEndpoint, nativeGrantRoute(url, body), launchHome), purpose) }
 }
 
 // The installed runtime's own ticket client: every Windows mint (SID-validated pipe), and a POSIX
 // home whose group-write only Python can prove private.
-let pythonTicketClient: ((endpoint: GatewayEndpoint, purpose: 'interactive' | 'native-http' | 'native-profile-create') => Promise<string>) | undefined
+let pythonTicketClient: ((endpoint: GatewayEndpoint, purpose: GatewayTicketPurpose) => Promise<string>) | undefined
 
 export function configurePythonGatewayTicketClient(client: NonNullable<typeof pythonTicketClient>) {
   pythonTicketClient = client
 }
 
-async function mintGroupWritableHome(endpoint: GatewayEndpoint, purpose: 'interactive' | 'native-http' | 'native-profile-create', homes: string[]) {
+async function mintGroupWritableHome(endpoint: GatewayEndpoint, purpose: GatewayTicketPurpose, homes: string[]) {
   if (!pythonTicketClient) {throw new Error(`Unsafe gateway control path: profile home is group-writable and this Desktop cannot verify the group is private: run chmod g-w ${homes.map(shellQuote).join(' ')}`)}
 
   try {
@@ -584,11 +602,11 @@ async function resolveControlSocket(home: string): Promise<string> {
 /** The Desktop's interactive socket is the one shared-primary route: its renderer selects every
  *  served sibling with a `profile` param, so it asks for a host-scoped grant explicitly. Every
  *  other ticket (and every other client's) stays bound to the one profile it names. */
-export function ticketScope(purpose: 'interactive' | 'native-http' | 'native-profile-create'): { scope?: 'host' } {
+export function ticketScope(purpose: GatewayTicketPurpose): { scope?: 'host' } {
   return purpose === 'interactive' ? { scope: 'host' } : {}
 }
 
-export async function mintLocalGatewayTicket(endpoint: GatewayEndpoint, purpose: 'interactive' | 'native-http' | 'native-profile-create' = 'interactive'): Promise<string> {
+export async function mintLocalGatewayTicket(endpoint: GatewayEndpoint, purpose: GatewayTicketPurpose = 'interactive'): Promise<string> {
   if (process.platform === 'win32') {
     if (!pythonTicketClient) {throw new Error('Gateway ticket client is not configured')}
 

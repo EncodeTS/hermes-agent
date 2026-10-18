@@ -1007,6 +1007,21 @@ function translateSelfProfileQuery(path, profile, backendProfile) {
  * gateway host serving every profile, scoped per request). An explicit
  * `?profile=` already on the path wins; an empty profile is a no-op.
  */
+// `/api/profiles/<suffix>` routes that are collections, not a profile named in the path. Matched on
+// the whole suffix (the gateway's native_http._check_profile_scope and local-gateway.ts's
+// PROFILE_COLLECTION_ROUTES use the same set), so a profile NAMED `sessions` keeps its own path.
+const PROFILE_COLLECTION_SUFFIXES = new Set([
+  'active', 'import', 'projects/tree', 'sessions', 'sessions/pull-requests', 'sessions/sidebar'
+])
+
+/** True for `/api/profiles/<name>[/…]`: the path itself names the target profile (#140791). */
+function pathNamesProfile(pathname: string): boolean {
+  const suffix = pathname.replace(/\/+$/, '').startsWith('/api/profiles/')
+    ? pathname.replace(/\/+$/, '').slice('/api/profiles/'.length) : ''
+
+  return Boolean(suffix) && !PROFILE_COLLECTION_SUFFIXES.has(suffix)
+}
+
 function pathWithProfileScope(path, profile) {
   const scopedProfile = connectionScopeKey(profile)
 
@@ -1028,7 +1043,9 @@ function pathWithProfileScope(path, profile) {
     return path
   }
 
-  if (parsed.searchParams.has('profile')) {
+  // A path that already names its profile never also carries the ambient one: the two disagree
+  // whenever the sidebar is on another profile or "All profiles", and the gateway refuses the pair.
+  if (parsed.searchParams.has('profile') || pathNamesProfile(parsed.pathname)) {
     return path
   }
 
