@@ -522,7 +522,30 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     if not scope.docker_profile_scoped:
         return _qualify_task_key(f"session:{session_key}")
     profile = _current_session_profile() or "default"
-    return "default" if profile == "default" else f"profile:{profile}"
+    base = "default" if profile == "default" else f"profile:{profile}"
+    return _workspace_container_key(base, task_id)
+
+
+def _workspace_container_key(base: str, task_id: Optional[str]) -> str:
+    """Persistent Docker key for a session that registered a workspace: one container per
+    (profile, workspace), not per profile (#140665).
+
+    A gateway-owned CLI/Desktop session registers its client cwd as a ``cwd_source: "session"``
+    override (``gateway.session_policy.bind_turn_workspace``). Keyed by profile alone, every
+    concurrent session shared the container bound to whichever workspace created it first; sessions
+    in the same folder still share one. Sessions with no registered workspace keep the profile key.
+    Reads the raw table (not :func:`resolve_task_overrides`, which calls back into key resolution).
+    """
+    overrides = _task_env_overrides.get(_qualify_task_key(task_id)) if task_id else None
+    cwd = overrides.get("cwd") if overrides and overrides.get("cwd_source") == "session" else None
+    if not isinstance(cwd, str) or not cwd.strip():
+        return base
+    import hashlib
+    try:
+        resolved = os.path.realpath(os.path.expanduser(cwd))
+    except OSError:
+        resolved = cwd
+    return f"{base}:ws:{hashlib.sha256(resolved.encode('utf-8')).hexdigest()[:16]}"
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> dict[str, Any]:

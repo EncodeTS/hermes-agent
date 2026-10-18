@@ -927,6 +927,29 @@ def policy_scope(policy, *, authority=None):
         _TURN_PROFILE.reset(profile_token)
 
 
+def bind_turn_workspace(policy, task_id):
+    """Make the session's frozen workspace its terminal cwd override for this turn's tools (#140665).
+
+    The client's cwd (or ``--in DIR``) is frozen into the policy at admission, but the terminal tool
+    mounts ``resolve_task_overrides(task_id)['cwd']`` into a per-session Docker container. Before the
+    one-gateway runtime each ``hermes chat`` was its own process with its own ``TERMINAL_CWD``; now the
+    turn runs here, so register it under the turn's own task id (inside the turn's routed scope, which
+    qualifies the key). Docker mounting the host cwd only: the local backend already runs in the
+    policy's ``TERMINAL_CWD``, and ssh and the other sandboxes keep their own cwd. Re-registered only
+    when the workspace changed, so an agent's ``cd`` inside the session survives later turns.
+    """
+    if policy is None or not task_id:
+        return
+    terminal = json.loads(policy.terminal_json)
+    if str(terminal.get('TERMINAL_ENV') or '').strip().lower() != 'docker' or not terminal_uses_host_cwd(terminal):
+        return
+    from tools.terminal_tool import register_task_env_overrides, resolve_task_overrides
+    current = resolve_task_overrides(task_id)
+    if current.get('cwd') == policy.cwd and current.get('cwd_source') == 'session':
+        return
+    register_task_env_overrides(task_id, {**current, 'cwd': policy.cwd, 'cwd_source': 'session'})
+
+
 @contextmanager
 def profile_read_scope(policy, authority):
     """Hold ONE read of a following session's profile for every resolution inside, as a turn's
