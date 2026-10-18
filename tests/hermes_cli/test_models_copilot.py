@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import Mock
 
 import pytest
 
@@ -35,12 +36,15 @@ import pytest
     ],
 )
 def test_copilot_selects_advertised_http_wire_or_compatible_fallback(
-    model_id, catalog_id, endpoints, expected,
+    monkeypatch, model_id, catalog_id, endpoints, expected,
 ):
-    from hermes_cli.models import copilot_model_api_mode
+    from hermes_cli import models
 
     catalog = [{"id": catalog_id, "supported_endpoints": endpoints}] if catalog_id else None
-    assert copilot_model_api_mode(model_id, catalog=catalog) == expected
+    fetch = Mock(return_value=catalog)
+    monkeypatch.setattr(models, "fetch_github_model_catalog", fetch)
+    assert models.copilot_model_api_mode(model_id, catalog=catalog, api_key="test-token") == expected
+    assert fetch.call_count == (1 if catalog is None else 0)
 
 
 @pytest.mark.parametrize("provider", ["copilot", "github-copilot", None])
