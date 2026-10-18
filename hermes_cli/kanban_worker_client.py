@@ -8,6 +8,7 @@ except ModuleNotFoundError as exc:
         raise
 
 import asyncio
+import math
 import os
 from pathlib import Path
 import sys
@@ -39,7 +40,13 @@ async def run(params, board_db):
 async def _submit_claim(client, params, board_db):
     from hermes_cli.gateway_client import GatewayClientError
     db = str(await asyncio.to_thread(Path(board_db).resolve))
-    accepted = await client.rpc('kanban.run', **dict(params, db=db))
+    # No deadline on the admission answer: the owner checks the claim and writes its
+    # ``owner_admitted`` marker in one board write transaction first, and the board (the
+    # cross-profile dispatch bus) has a 120 s busy timeout. Giving up at the 30 s default left
+    # the owner admitting an attempt whose submitter had exited, so the later-bound worker's
+    # submitter-liveness watcher ended it and the admission was left ``unknown``. A hang-up still
+    # fails the wait; the dispatcher's runtime cap and reclaim bound a stuck submitter.
+    accepted = await client.rpc('kanban.run', _timeout=math.inf, **dict(params, db=db))
     sid, receipt = accepted['session_id'], accepted['receipt']
     print(f'Session: {sid}', file=sys.stderr)
     while receipt['status'] not in {'terminal', 'unknown'}:
